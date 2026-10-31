@@ -1,7 +1,9 @@
-# 规范化规则细则（normalize.py 行为说明）
+# 规范化规则细则（normalize.mjs 行为说明）
 
-本文件是 `scripts/normalize.py` 的行为规格说明，供排查「某处为什么没转换 / 为什么被转换」时查阅。
-修改脚本行为前请先阅读本文，并同步更新 `scripts/selftest.py` 中的用例。
+本文件是 `scripts/normalize.mjs` 的行为规格说明，供排查「某处为什么没转换 / 为什么被转换」时查阅。
+修改脚本行为前请先阅读本文，并同步更新 `scripts/selftest.mjs` 中的用例。
+
+运行环境：Node.js >= 18，ESM，零第三方依赖（`opencc-js` 为可选增强）。
 
 ## 1. 数字
 
@@ -67,7 +69,9 @@
 
 ## 3. 繁转简
 
-- 后端：OpenCC `t2s`（词组级）；不可用时降级为内置 `data/TSCharacters.txt` + `data/TSPhrases.txt`（单字 + 词组最长匹配）。
+- 后端：`--backend auto`（默认）在 `opencc-js` 可解析时调用它做词组级转换，否则用内置
+  `data/TSCharacters.txt` + `data/TSPhrases.txt`（单字 + 词组最长匹配，等价于 OpenCC `t2s`）。
+  `--backend builtin` / `--backend opencc` 可强制指定；实际使用的后端显示在 `--report` 的 `backend=` 字段。
 - 受保护片段用私用区占位符遮蔽后再送入转换器，确保原文逐字还原，且相邻中文仍保留词组上下文。
 - 若发现整词被替换（如术语被 OpenCC 改写），用 `--protect` 保护该词后重跑。
 
@@ -109,5 +113,10 @@ Markdown 结构（`--format md`，`.md/.markdown/.mdx` 自动识别）：
 
 ## 7. 回归测试
 
-`python scripts/selftest.py`（OpenCC 后端）与 `python scripts/selftest.py --no-opencc`（内置字表后端）需双双全绿。
-新增规则时，先在 `CASES` 中补一条 `(名称, 输入, 期望输出, 额外参数)`。
+```bash
+node scripts/selftest.mjs              # 内置字表 + opencc-js（若已安装）各跑一遍
+node scripts/selftest.mjs --only-builtin
+node scripts/selftest.mjs --only-opencc
+```
+
+两个后端都需全绿。新增规则时，先在 `CASES` 中补一条 `[名称, 输入, 期望输出, 额外选项]`。

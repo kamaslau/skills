@@ -3,13 +3,13 @@ name: text-normalize-zh-hans
 repo: https://github.com/kamaslau/skills
 description: "中文文本字形级规范化：全角阿拉伯数字转半角、半角标点转全角、非简体中文字符转简体（日语/韩语/朝鲜语人名例外），严禁润色或改写语法。当用户提到「文字处理」「文本规范化」「排版清理」「繁转简」「全角半角」「标点全角化」「数字半角化」，或粘贴一段中英混排、繁简混排的文本要求处理时，应使用本技能。适用于 .txt/.md 等文件与对话中的文本片段。"
 allowed-tools: Bash, Read, Edit
-version: 1.0.0
+version: 2.0.0
 agent_created: true
 ---
 
 # 中文文本规范化（text-normalize-zh-hans）
 
-对中文文本执行**纯字形级**替换，由 `scripts/normalize.py` 确定性完成。
+对中文文本执行**纯字形级**替换，由 `scripts/normalize.mjs`（Node.js ESM，零依赖）确定性完成。
 
 ## 四条红线（任何情况下不得违反）
 
@@ -20,12 +20,16 @@ agent_created: true
 
 脚本只做字形映射，不改语义。若 `--report` 显示繁简改动处数异常偏大，应抽查「繁简示例」确认没有发生词语替换。
 
+## 运行环境
+
+仅需 **Node.js >= 18**（用到 `String.prototype.matchAll`、正则后行断言、RegExp `/d` indices）。无 npm 依赖、可离线运行。
+
 ## 工作流
 
 ### Step 1：估算改动规模（只读，不改文件）
 
 ```bash
-python scripts/normalize.py <文件> --check --report
+node scripts/normalize.mjs <文件> --check --report
 ```
 
 退出码 `0` 表示无需改动，`1` 表示存在可改动项。先看 `数字/标点/繁简` 三项计数是否与预期相符，再决定是否执行。
@@ -40,7 +44,7 @@ python scripts/normalize.py <文件> --check --report
 内置表无法覆盖冷僻人名，因此需通读一遍文本，把识别出的日语/韩语/朝鲜语人名用 `--protect` 传入：
 
 ```bash
-python scripts/normalize.py <文件> --protect "鳩山由紀夫,盧武鉉" --in-place
+node scripts/normalize.mjs <文件> --protect "鳩山由紀夫,盧武鉉" --in-place
 ```
 
 也可用 `--protect-name`（可重复）或 `--protect-file`（一行一个）。长期复用的人名建议直接追加进 `data/names_ja_ko.txt`。
@@ -48,19 +52,19 @@ python scripts/normalize.py <文件> --protect "鳩山由紀夫,盧武鉉" --in-
 ### Step 3：执行转换
 
 ```bash
-python scripts/normalize.py <文件> --in-place --report      # 覆盖原文件
-python scripts/normalize.py <文件> --suffix .norm --report  # 输出 <文件>.norm，保留原件
-python scripts/normalize.py --text "這是一段測試,數字１２３"   # 处理对话中的文本片段
-python scripts/normalize.py a.md b.md --in-place            # 批量（必须显式指定写回方式）
+node scripts/normalize.mjs <文件> --in-place --report      # 覆盖原文件
+node scripts/normalize.mjs <文件> --suffix .norm --report  # 输出 <文件>.norm，保留原件
+node scripts/normalize.mjs --text "這是一段測試,數字１２３"   # 处理对话中的文本片段
+node scripts/normalize.mjs a.md b.md --in-place            # 批量（必须显式指定写回方式）
 ```
 
 ### Step 4：复核（必做）
 
 ```bash
-python scripts/normalize.py <文件> --check --diff
+node scripts/normalize.mjs <文件> --check --diff
 ```
 
-复核要点：改动是否仅限「数字/标点/繁简字形」三类；是否存在整词被替换成另一个词（说明命中 OpenCC 词组表，需用 `--protect` 保护该词后重跑）。
+复核要点：改动是否仅限「数字/标点/繁简字形」三类；是否存在整词被替换成另一个词（说明命中转换词表，需用 `--protect` 保护该词后重跑）。
 
 ## 常用参数
 
@@ -78,16 +82,25 @@ python scripts/normalize.py <文件> --check --diff
 | `--format md\|text\|auto` | 强制输入格式，默认按扩展名判断 |
 | `--convert-frontmatter` | 让 YAML frontmatter 也参与转换（默认保护） |
 | `--no-names` / `--names-file` | 关闭人名保护 / 指定自定义人名表 |
-| `--no-auto-install` | OpenCC 缺失时不自动 pip 安装，直接用内置字表 |
+| `--backend auto\|builtin\|opencc` | 繁转简后端，默认 `auto` |
 
 ## 后端与依赖
 
-优先使用 OpenCC（`opencc-python-reimplemented`）做词组级繁转简；未安装时脚本尝试自动 pip 安装，失败则降级到内置字表 `data/TSCharacters.txt` + `data/TSPhrases.txt`（源自 OpenCC，见 `data/ATTRIBUTION.md`），离线可用。
+零依赖即可运行：未安装 `opencc-js` 时使用内置字表 `data/TSCharacters.txt` + `data/TSPhrases.txt`（源自 OpenCC，见 `data/ATTRIBUTION.md`），词组最长匹配，离线可用。
+
+`opencc-js` 为**可选增强**（词组级转换、速度更快）。若安装，`--backend auto` 会自动优先使用它：
 
 ```bash
-python -m pip install opencc-python-reimplemented   # 可选，建议预装
-python scripts/selftest.py                          # 回归测试
-python scripts/selftest.py --no-opencc              # 用内置字表跑同一组测试
+npm i opencc-js                  # 可选；装在本技能目录或其任一上级目录
+node scripts/normalize.mjs <文件> --backend builtin   # 强制用内置字表
+```
+
+`--report` 的 `backend=` 字段会显示本次实际使用的后端，便于审计。
+
+```bash
+node scripts/selftest.mjs              # 回归测试（内置字表 + opencc-js 各跑一遍）
+node scripts/selftest.mjs --only-builtin
+node scripts/selftest.mjs --only-opencc
 ```
 
 ## 已知边界
@@ -96,4 +109,5 @@ python scripts/selftest.py --no-opencc              # 用内置字表跑同一�
 - Markdown 链接/图片只保护定界符与 URL，**链接文字照常转换**。
 - 英文散文中的半角标点（如 `This is a test, isn't it?`）不转换，因为左右均无中文上下文。
 - 全角英文字母（`ＡＢＣ`）不在需求范围内，不做转换。
+- 全程按 UTF-16 码元索引处理；本工具关心的字符均在 BMP，行为与按码点处理一致。
 - 完整映射表与判定细节见 `references/rules.md`。
