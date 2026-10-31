@@ -25,7 +25,27 @@ const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const SKILL_DIR = dirname(SCRIPT_DIR);
 const DATA_DIR = join(SKILL_DIR, 'data');
 
-const VERSION = '2.0.0';
+const VERSION = '2.1.0';
+
+// 悬空标点强度表：相邻两个标点强度不同时丢弃较弱者，强度相同则原样保留
+// （`！！`、`！？` 这类重复常是有意为之，不做合并）。
+const PUNCT_STRENGTH = new Map([
+  ['、', 1],
+  ['，', 2],
+  ['；', 3],
+  ['：', 4],
+  ['。', 5],
+  ['！', 6],
+  ['？', 6],
+]);
+
+/** @returns {number|undefined} */
+function punctStrength(ch) {
+  return ch ? PUNCT_STRENGTH.get(ch) : undefined;
+}
+
+// 空白清理模式
+const WHITESPACE_MODES = ['blank', 'full', 'off'];
 
 // ---------------------------------------------------------------- 字符分类
 
@@ -169,6 +189,19 @@ function isAsciiAlnum(ch) {
   return !!ch && RE_ASCII_ALNUM.test(ch);
 }
 
+/** 全角英文字母（U+FF21–FF3A / U+FF41–FF5A） */
+function isFullwidthLetter(ch) {
+  if (!ch) return false;
+  const c = ch.charCodeAt(0);
+  return (c >= 0xff21 && c <= 0xff3a) || (c >= 0xff41 && c <= 0xff5a);
+}
+
+function halfwidthLetter(ch) {
+  const c = ch.charCodeAt(0);
+  if (c >= 0xff21 && c <= 0xff3a) return String.fromCharCode(0x41 + (c - 0xff21));
+  return String.fromCharCode(0x61 + (c - 0xff41));
+}
+
 // ---------------------------------------------------------------- 繁转简后端
 
 /**
@@ -303,7 +336,9 @@ export function structuralSpans(text, fmt, protectFrontmatter = true) {
     const stripped = line.trim();
     const fm = /^[ \t]*(```|~~~)/.exec(line);
     if (inFence) {
-      spans.push([start, end]);
+      // 连行尾换行符一并保护：空行的 [start,end] 长度为 0，若不覆盖换行符，
+      // 代码块内的空行会被后续的空白压缩误删。
+      spans.push([start, Math.min(end + 1, text.length)]);
       if (fm && fm[1] === fenceTok) {
         inFence = false;
         fenceTok = null;
@@ -311,7 +346,7 @@ export function structuralSpans(text, fmt, protectFrontmatter = true) {
     } else if (fm) {
       inFence = true;
       fenceTok = fm[1];
-      spans.push([start, end]);
+      spans.push([start, Math.min(end + 1, text.length)]);
     } else if (md) {
       if (stripped.startsWith('|')) {
         spans.push([start, end]);
@@ -526,7 +561,10 @@ function decidePunct(text, i, ch, opts, out) {
   const q = nextChar(text, i);
   const pch = p >= 0 ? out[p] : '';
   const qch = q >= 0 ? text[q] : '';
-  const pcjk = isCjk(pch);
+  // 左邻的 CJK 判定同时参考「原字符」：全角数字/字母会被本轮换成半角，
+  // 但它们在原文里属于 CJK 语境（否则「數字１.」的句点会漏判）。
+  const pch0 = p >= 0 ? text[p] : '';
+  const pcjk = isCjk(pch) || isCjk(pch0);
   const qcjk = isCjk(qch);
 
   if (ch === '.') {
@@ -622,6 +660,12 @@ function transformPunctDigits(text, protectedMask, opts, stats) {
       continue;
     }
 
+    if (opts.doLetters && isFullwidthLetter(ch)) {
+      out[i] = halfwidthLetter(ch);
+      stats.letters += 1;
+      continue;
+    }
+
     if (
       ch === '.' ||
       Object.prototype.hasOwnProperty.call(PUNCT_MAP, ch) ||
@@ -647,6 +691,116 @@ function transformPunctDigits(text, protectedMask, opts, stats) {
     }
   }
   return out.join('');
+}
+
+// ---------------------------------------------------------------- 空白 / 悬空标点
+
+/** 按保护掩码把文本切成连续的 {text, protected, start} 片段 */
+function runsByMask(text, mask) {
+  const runs = [];
+  const n = text.length;
+  let i = 0;
+  while (i < n) {
+    const flag = mask[i] ? 1 : 0;
+    let j = i;
+    while (j < n && (mask[j] ? 1 : 0) === flag) j += 1;
+    runs.push({ text: text.slice(i, j), protected: flag === 1, start: i });
+    i = j;
+  }
+  return runs;
+}
+
+/**
+ * 移除冗余空字符。
+ * - blank（默认）：连续 3+ 换行压到 2（至多保留一个空行）；空白行清空；
+ *   文首空行删除；文末连续换行收敛为一个。**不动行尾空格**——Markdown 靠
+ *   行尾两空格表示硬换行，删掉会改渲染。
+ * - full：在 blank 之上额外移除每行行尾空白（含全角空格）。
+ * - off：不动。
+ *
+ * 受保护区域（代码块等）内的换行原样保留。
+ */
+export function collapseWhitespace(text, mask, mode, stats) {
+  if (mode === 'off' || !text.length) return text;
+
+  let out = '';
+  for (const run of runsByMask(text, mask)) {
+    if (run.protected) {
+      out += run.text;
+      continue;
+    }
+    let s = run.text;
+    if (mode === 'full') {
+      // 行尾空白与文末空白
+      s = s.replace(/[ \t　]+(?=\r?\n|$)/g, '');
+    } else {
+      // 仅清空「空白行」：整行只有空格 / 制表 / 全角空格
+      s = s.replace(/(?<=\r?\n)[ \t　]+(?=\r?\n|$)/g, '');
+      if (run.start === 0) s = s.replace(/^[ \t　]+(?=\r?\n|$)/, '');
+    }
+    s = s.replace(/(?:\r?\n)(?:[ \t　]*\r?\n){2,}/g, (m) =>
+      m.startsWith('\r\n') ? '\r\n\r\n' : '\n\n',
+    );
+    // 若片段紧接在一个换行之后（上一片段结尾不可删），本片段开头的换行
+    // 属于同一串换行：为凑满「至多两个」只保留一个。
+    if (run.start > 0 && text[run.start - 1] === '\n') {
+      s = s.replace(/^(?:\r?\n){2,}/, (m) => (m.startsWith('\r\n') ? '\r\n' : '\n'));
+    }
+    out += s;
+  }
+
+  if (!mask[0]) out = out.replace(/^(?:\r?\n)+/, '');
+  if (!mask[text.length - 1]) out = out.replace(/(\r?\n)(?:\r?\n)+$/, '$1');
+
+  const removed = text.length - out.length;
+  if (removed > 0) stats.whitespace += removed;
+  return out;
+}
+
+/**
+ * 移除悬空标点：把「连续标点串」收敛为其最强者。
+ * - 强度不同时只保留强度最高的字符（`，。` → `。`、`，；` → `；`、`。，` → `。`）
+ * - 整串强度相同时原样保留（`！！`、`？！` 这类重复常为有意强调）
+ */
+export function removeDanglingPunct(text, mask, stats) {
+  let out = '';
+  for (const run of runsByMask(text, mask)) {
+    if (run.protected) {
+      out += run.text;
+      continue;
+    }
+    const s = run.text;
+    const n = s.length;
+    let buf = '';
+    let i = 0;
+    while (i < n) {
+      if (punctStrength(s[i]) === undefined) {
+        buf += s[i];
+        i += 1;
+        continue;
+      }
+      // 找出一段连续的标点串 [i, j)，取其最高强度
+      let j = i;
+      let max = 0;
+      while (j < n) {
+        const st = punctStrength(s[j]);
+        if (st === undefined) break;
+        if (st > max) max = st;
+        j += 1;
+      }
+      let kept = 0;
+      for (let k = i; k < j; k++) {
+        if (punctStrength(s[k]) === max) {
+          buf += s[k];
+          kept += 1;
+        }
+      }
+      stats.dangling += j - i - kept;
+      i = j;
+    }
+    out += buf;
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------- 通用 diff
@@ -812,21 +966,8 @@ function convertHanzi(text, protectedMask, convert, stats) {
 
 // ---------------------------------------------------------------- 主流程
 
-/**
- * 对单段文本执行规范化。
- * @param {string} text
- * @param {object} opts
- * @param {(s:string)=>string} convert
- */
-export function normalizeText(text, opts, convert) {
-  const stats = { digits: 0, punct: 0, hanzi: 0, examples: [] };
-
-  const spans = structuralSpans(text, opts.format, opts.protectFrontmatter);
-  const protectedMask = new Uint8Array(text.length);
-  for (const [s, e] of spans) {
-    for (let i = s; i < Math.min(e, text.length); i++) protectedMask[i] = 1;
-  }
-
+/** 收集用户显式传入的保护名单 */
+function collectExtraNames(opts) {
   const extra = new Set();
   if (opts.protect) {
     for (const x of String(opts.protect).split(',')) {
@@ -844,27 +985,77 @@ export function normalizeText(text, opts, convert) {
       if (t && !t.startsWith('#')) extra.add(t);
     }
   }
+  return extra;
+}
 
+/** 构建保护掩码：结构区域 + 日韩人名（或仅用户名单）。导出供调试与测试使用。 */
+export function buildMask(text, opts, extra) {
+  const mask = new Uint8Array(text.length);
+  for (const [s, e] of structuralSpans(text, opts.format, opts.protectFrontmatter)) {
+    for (let i = s; i < Math.min(e, text.length); i++) mask[i] = 1;
+  }
   if (opts.useNames) {
-    for (const [s, e] of nameSpans(text, protectedMask, opts.names ?? new Set(), extra)) {
-      for (let i = s; i < e; i++) protectedMask[i] = 1;
+    for (const [s, e] of nameSpans(text, mask, opts.names ?? new Set(), extra)) {
+      for (let i = s; i < e; i++) mask[i] = 1;
     }
   } else if (extra.size) {
     for (const [s, e] of substringSpans(text, extra)) {
-      for (let i = s; i < e; i++) protectedMask[i] = 1;
+      for (let i = s; i < e; i++) mask[i] = 1;
+    }
+  }
+  return mask;
+}
+
+/**
+ * 对单段文本执行规范化。
+ * 流程：冗余空白清理 → 数字/字母/标点 → 繁转简 → 悬空标点。
+ *
+ * 顺序是硬约束：空白清理与悬空标点都会**改变文本长度**，而保护掩码是按索引
+ * 标注的。空白清理之后必须重算掩码（下方已处理）；悬空标点则必须放在最后一步
+ * ——它之后不再有依赖掩码的操作，因此无需重算。（曾把它放在繁转简之前，掩码
+ * 整体前移，导致「安倍晋三」的保护错落到「倍晋三與」上。）
+ * 数字/字母/标点三步都是等长替换，不影响掩码。
+ *
+ * @param {string} text
+ * @param {object} opts
+ * @param {(s:string)=>string} convert
+ */
+export function normalizeText(text, opts, convert) {
+  const stats = {
+    digits: 0,
+    letters: 0,
+    punct: 0,
+    whitespace: 0,
+    dangling: 0,
+    hanzi: 0,
+    examples: [],
+  };
+
+  const extra = collectExtraNames(opts);
+  let working = text;
+  let mask = buildMask(working, opts, extra);
+
+  if (opts.whitespace !== 'off') {
+    const cleaned = collapseWhitespace(working, mask, opts.whitespace, stats);
+    if (cleaned !== working) {
+      working = cleaned;
+      mask = buildMask(working, opts, extra); // 索引已变，掩码必须重算
     }
   }
 
-  let result = text;
-  if (opts.doPunct || opts.doDigits) {
-    result = transformPunctDigits(result, protectedMask, opts, stats);
+  if (opts.doPunct || opts.doDigits || opts.doLetters) {
+    working = transformPunctDigits(working, mask, opts, stats);
   }
   if (opts.doT2s) {
-    result = convertHanzi(result, protectedMask, convert, stats);
+    working = convertHanzi(working, mask, convert, stats);
+  }
+  // 悬空标点清理会缩短文本，必须放在最后（见上方流程说明）
+  if (opts.doDangling) {
+    working = removeDanglingPunct(working, mask, stats);
   }
 
   stats.namesProtected = extra.size;
-  return { text: result, stats };
+  return { text: working, stats };
 }
 
 // ---------------------------------------------------------------- 文件 I/O
@@ -906,7 +1097,8 @@ function readStdin() {
 // ---------------------------------------------------------------- 输出
 
 function emitReport(label, stats, backend, asJson) {
-  const total = stats.digits + stats.punct + stats.hanzi;
+  const total =
+    stats.digits + stats.letters + stats.punct + stats.whitespace + stats.dangling + stats.hanzi;
   if (asJson) {
     process.stderr.write(
       `${JSON.stringify({ target: label, backend, total, ...stats }, null, 0)}\n`,
@@ -914,8 +1106,9 @@ function emitReport(label, stats, backend, asJson) {
     return;
   }
   process.stderr.write(
-    `[report] ${label}: 数字 ${stats.digits} 处 / 标点 ${stats.punct} 处 / ` +
-      `繁简 ${stats.hanzi} 处 / 共 ${total} 处  (backend=${backend})\n`,
+    `[report] ${label}: 数字 ${stats.digits} / 字母 ${stats.letters} / 标点 ${stats.punct} / ` +
+      `空白 ${stats.whitespace} / 悬空标点 ${stats.dangling} / 繁简 ${stats.hanzi} ` +
+      `/ 共 ${total} 处  (backend=${backend})\n`,
   );
   for (const ex of stats.examples.slice(0, 12)) {
     process.stderr.write(`         繁简示例: ${ex.from} → ${ex.to}\n`);
@@ -970,6 +1163,11 @@ const HELP = `normalize.mjs — 中文文本字形级规范化（Node.js ESM，�
   --quotes fullwidth|curly|keep         引号策略，默认 fullwidth（" → ＂）
   --symbols                  额外转换 @ # $ % & * + = / \\ ^ _ 等半角符号
   --no-t2s / --no-punct / --no-digits   单独关闭某一类转换
+  --no-letters               关闭全角英文字母转半角（ＡＢＣ → ABC，默认开启）
+  --whitespace blank|full|off           冗余空字符清理，默认 blank
+                             blank: 3+ 换行压到 2、空白行清空、文首/文末空行收敛
+                             full: 在 blank 之上再删每行行尾空白（含全角空格）
+  --no-dangling              关闭悬空标点清理（，。 → 。，默认开启）
   --convert-frontmatter      让 YAML frontmatter 也参与转换（默认保护）
 
 保护名单:
@@ -991,7 +1189,7 @@ const HELP = `normalize.mjs — 中文文本字形级规范化（Node.js ESM，�
 
 const VALUE_FLAGS = new Set([
   '--text', '--output', '--suffix', '--format', '--protect', '--protect-name',
-  '--protect-file', '--names-file', '--period', '--quotes', '--backend',
+  '--protect-file', '--names-file', '--period', '--quotes', '--backend', '--whitespace',
 ]);
 const SHORT_VALUE = { '-o': '--output' };
 
@@ -1018,6 +1216,9 @@ export function parseArgs(argv) {
     doT2s: true,
     doPunct: true,
     doDigits: true,
+    doLetters: true,
+    doDangling: true,
+    whitespace: 'blank',
     period: 'ideographic',
     quotes: 'fullwidth',
     symbols: false,
@@ -1082,10 +1283,13 @@ export function parseArgs(argv) {
       case '--period': opts.period = value; break;
       case '--quotes': opts.quotes = value; break;
       case '--backend': opts.backend = value; break;
+      case '--whitespace': opts.whitespace = value; break;
       case '--no-names': opts.useNames = false; break;
       case '--no-t2s': opts.doT2s = false; break;
       case '--no-punct': opts.doPunct = false; break;
       case '--no-digits': opts.doDigits = false; break;
+      case '--no-letters': opts.doLetters = false; break;
+      case '--no-dangling': opts.doDangling = false; break;
       case '--convert-frontmatter': opts.protectFrontmatter = false; break;
       default:
         if (arg.startsWith('-')) throw new Error(`未知选项: ${arg}`);
@@ -1108,6 +1312,9 @@ function validateOptions(opts) {
   }
   if (!['auto', 'builtin', 'opencc'].includes(opts.backend)) {
     throw new Error(`--backend 取值非法: ${opts.backend}`);
+  }
+  if (!WHITESPACE_MODES.includes(opts.whitespace)) {
+    throw new Error(`--whitespace 取值非法: ${opts.whitespace}`);
   }
 }
 

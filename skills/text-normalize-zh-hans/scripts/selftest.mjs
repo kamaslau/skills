@@ -50,6 +50,33 @@ const CASES = [
   ['半角引号转换', '他说"你好";她点头', '他说＂你好＂；她点头', {}],
   ['波浪号范围', '第1~5页,共3页', '第1～5页，共3页', {}],
   ['不润色：词语与语序不变', '這是一段繁體中文(包含標點,數字１２３)。', '这是一段繁体中文（包含标点，数字123）。', {}],
+
+  // —— 全角英文字母 → 半角
+  ['全角字母转半角', '型号ＡＢＣ与版本ｄｅｆ,請確認', '型号ABC与版本def，请确认', {}],
+  ['全角字母在保护区内保留', '代码 `ＡＢＣ` 结束', '代码 `ＡＢＣ` 结束', {}],
+  ['全角字母作为中文语境', '见附录Ａ.说明', '见附录A。说明', {}],
+
+  // —— 冗余空字符
+  ['连续换行压缩', '第一段\n\n\n\n第二段', '第一段\n\n第二段', {}],
+  ['空白行清空', '第一段\n   \n第二段', '第一段\n\n第二段', {}],
+  ['文首空行删除', '\n\n正文', '正文', {}],
+  ['文末多余换行收敛', '正文\n\n\n', '正文\n', {}],
+  ['blank 模式保留行尾空格', '正文   \n结束', '正文   \n结束', {}],
+  ['full 模式删除行尾空白', '正文   \n结束', '正文\n结束', { whitespace: 'full' }],
+  ['Markdown frontmatter 后空行收敛', '---\ntitle: 甲\n---\n\n\n\n正文', '---\ntitle: 甲\n---\n\n正文', {}],
+  ['代码块后空行收敛', '```\nlet a = 1;\n```\n\n\n\n正文', '```\nlet a = 1;\n```\n\n正文', {}],
+  ['代码块内重复换行保留', '```\na\n\n\n\nb\n```\n結束', '```\na\n\n\n\nb\n```\n结束', {}],
+
+  // —— 悬空标点
+  ['逗号句号连用', '这是一句,。下一句', '这是一句。下一句', {}],
+  ['分号句号连用', '内容;。结束', '内容。结束', {}],
+  ['逗号分号连用', '甲,;乙', '甲；乙', {}],
+  ['句末后逗号悬空', '结束了。，然后开始', '结束了。然后开始', {}],
+  ['多个弱标点连用', '甲,、。乙', '甲。乙', {}],
+  ['同强度标点保留', '太好了！！这是真的？！', '太好了！！这是真的？！', {}],
+  ['关闭悬空标点清理', '这是一句,。下一句', '这是一句，。下一句', { doDangling: false }],
+  // 悬空标点会缩短文本，必须晚于繁转简，否则保护掩码错位（真实 bug 回归）
+  ['悬空标点后人名仍受保护', '型號ＡＢＣ,版本ｄｅｆ;。\n\n安倍晋三與盧泰愚出席了這場電影', '型号ABC，版本def。\n\n安倍晋三与盧泰愚出席了这场电影', {}],
 ];
 
 // 需要以 Markdown 格式解析的用例（默认 --text 走 text 格式）
@@ -61,6 +88,9 @@ const BASE_OPTS = {
   doT2s: true,
   doPunct: true,
   doDigits: true,
+  doLetters: true,
+  doDangling: true,
+  whitespace: 'blank',
   period: 'ideographic',
   quotes: 'fullwidth',
   symbols: false,
@@ -90,8 +120,13 @@ async function runSuite(label, convert) {
       console.log(`       期望: ${JSON.stringify(expect)}`);
       console.log(`       实际: ${JSON.stringify(got)}`);
     } else {
+      const more = [];
+      if (stats.letters) more.push(`字母${stats.letters}`);
+      if (stats.whitespace) more.push(`空白${stats.whitespace}`);
+      if (stats.dangling) more.push(`悬空${stats.dangling}`);
       console.log(
-        `[ ok ] ${name}  (数字${stats.digits}/标点${stats.punct}/繁简${stats.hanzi})`,
+        `[ ok ] ${name}  (数字${stats.digits}/标点${stats.punct}` +
+          `${more.length ? '/' + more.join('/') : ''}/繁简${stats.hanzi})`,
       );
     }
   }
