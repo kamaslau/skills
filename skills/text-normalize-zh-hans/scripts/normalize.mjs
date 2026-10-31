@@ -9,23 +9,52 @@
  *   3. 半角标点符号 → 全角标点符号（上下文感知，避免破坏小数点/时间/代码/URL/缩写）。
  *   4. 非简体中文字符 → 简体中文字符（日语、韩语、朝鲜语人名除外）。
  *
- * 运行环境：Node.js >= 18（用到 String.prototype.matchAll、正则后行断言、
- * RegExp `/d` indices、Int32Array）。自身零依赖；`opencc-js` 为可选增强。
+ * 运行环境：Node.js >= 22（v22「Jod」是 nodejs.org 公示的**仍受支持的最低 LTS**；
+ * v20 及以下已 EOL）。所依赖的语言与标准库特性：
+ *   - node:util parseArgs        （v18.3 起，v20 转稳定）
+ *   - import.meta.dirname/filename（v20.11 / v21.2 起）
+ *   - 迭代器辅助 .map() / 生成器  （V8 12.2 → v22.0 起）
+ *   - Array.prototype.toSorted   （v20 起）
+ *   - String.prototype.replaceAll（v15 起）
+ *   - Object.hasOwn              （v16.9 起）
+ * 自身零第三方依赖；`opencc-js` 为可选增强。
  *
  * 实现说明：全程按 UTF-16 码元（code unit）索引，与 Python 版的码点索引在
  * BMP 内等价。本工具关心的字符（汉字、假名、谚文、全角符号）均在 BMP，
  * 因此行为一致。
  */
 
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
-import { dirname, join, extname } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { existsSync, readFileSync } from 'node:fs';
+import { readFile, writeFile } from 'node:fs/promises';
+import { join, extname, resolve } from 'node:path';
+import { parseArgs as parseArgv } from 'node:util';
 
-const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
-const SKILL_DIR = dirname(SCRIPT_DIR);
+const SCRIPT_DIR = import.meta.dirname;
+const SKILL_DIR = join(SCRIPT_DIR, '..');
 const DATA_DIR = join(SKILL_DIR, 'data');
 
-const VERSION = '2.1.0';
+const VERSION = '2.2.0';
+
+/** 最低 Node 版本：nodejs.org 公示的仍受支持的最低 LTS 主版本号 */
+const MIN_NODE_MAJOR = 22;
+
+/**
+ * 运行时版本校验。主版本低于下限时返回 ok:false。
+ * @returns {{ok: boolean, message: string}}
+ */
+export function checkRuntime() {
+  const current = process.versions.node;
+  const major = Number.parseInt(current.split('.')[0], 10);
+  if (Number.isNaN(major) || major < MIN_NODE_MAJOR) {
+    return {
+      ok: false,
+      message:
+        `需要 Node.js >= ${MIN_NODE_MAJOR}（当前 ${current}）。` +
+        `v${MIN_NODE_MAJOR} 是 Node.js 官网公示的仍受支持的最低 LTS 版本。`,
+    };
+  }
+  return { ok: true, message: '' };
+}
 
 // 悬空标点强度表：相邻两个标点强度不同时丢弃较弱者，强度相同则原样保留
 // （`！！`、`！？` 这类重复常是有意为之，不做合并）。
@@ -44,13 +73,10 @@ function punctStrength(ch) {
   return ch ? PUNCT_STRENGTH.get(ch) : undefined;
 }
 
-// 空白清理模式
-const WHITESPACE_MODES = ['blank', 'full', 'off'];
-
 // ---------------------------------------------------------------- 字符分类
 
 // 汉字 / 假名 / 谚文 / 中日韩标点 / 全角字符，统一视为「CJK 上下文」
-const CJK_RANGES = [
+const CJK_RANGES = Object.freeze([
   [0x3001, 0x303f], // CJK 标点（不含 U+3000 全角空格）
   [0x3040, 0x30ff], // 假名
   [0x31f0, 0x31ff], // 片假名扩展
@@ -60,26 +86,26 @@ const CJK_RANGES = [
   [0xf900, 0xfaff], // 兼容汉字
   [0xfe30, 0xfe4f], // CJK 兼容形式
   [0xff01, 0xffef], // 全角/半角形式
-];
+]);
 
-const KANA_RANGES = [
+const KANA_RANGES = Object.freeze([
   [0x3040, 0x30ff],
   [0x31f0, 0x31ff],
   [0xff66, 0xff9f],
   [0x30fb, 0x30fc],
-];
-const HANGUL_RANGES = [
+]);
+const HANGUL_RANGES = Object.freeze([
   [0xac00, 0xd7af],
   [0x1100, 0x11ff],
   [0x3130, 0x318f],
-];
-const HAN_RANGES = [
+]);
+const HAN_RANGES = Object.freeze([
   [0x2e80, 0x2eff],
   [0x2f00, 0x2fdf],
   [0x3400, 0x4dbf],
   [0x4e00, 0x9fff],
   [0xf900, 0xfaff],
-];
+]);
 
 // 高频中文虚词/常用字：日文独有字形向外扩展人名窗口时遇此集合即停止，
 // 避免把整句中文误判为人名。
@@ -97,7 +123,7 @@ const JAPANESE_ONLY = new Set(
 // 韩文独有汉字（国字）
 const KOREAN_ONLY = new Set('畓乭巭');
 
-const PUNCT_MAP = {
+const PUNCT_MAP = Object.freeze({
   ',': '，',
   ';': '；',
   ':': '：',
@@ -115,9 +141,9 @@ const PUNCT_MAP = {
   '|': '｜',
   '"': '＂',
   "'": '＇',
-};
+});
 
-const SYMBOL_MAP = {
+const SYMBOL_MAP = Object.freeze({
   '@': '＠',
   '#': '＃',
   '$': '＄',
@@ -131,10 +157,10 @@ const SYMBOL_MAP = {
   '^': '＾',
   '_': '＿',
   '`': '｀',
-};
+});
 
-const CURLY_OPEN = { '"': '“', "'": '‘' };
-const CURLY_CLOSE = { '"': '”', "'": '’' };
+const CURLY_OPEN = Object.freeze({ '"': '“', "'": '‘' });
+const CURLY_CLOSE = Object.freeze({ '"': '”', "'": '’' });
 
 // 常见拉丁缩写：句点属于缩写本身，不转换
 const ABBREVS = new Set([
@@ -148,14 +174,12 @@ const ABBREVS = new Set([
 ]);
 
 function inRanges(code, ranges) {
-  for (const [a, b] of ranges) if (code >= a && code <= b) return true;
-  return false;
+  return ranges.some(([a, b]) => code >= a && code <= b);
 }
 
 function isCjk(ch) {
   if (!ch) return false;
-  const code = ch.charCodeAt(0);
-  return inRanges(code, CJK_RANGES);
+  return inRanges(ch.charCodeAt(0), CJK_RANGES);
 }
 
 function isKana(ch) {
@@ -209,14 +233,17 @@ function halfwidthLetter(ch) {
  * 等价于 OpenCC 的 t2s 配置（TSCharacters + TSPhrases）。
  */
 export class FallbackT2S {
+  /** @type {Map<string,string>} */
+  #chars = new Map();
+  /** @type {Map<string,string>} */
+  #phrases = new Map();
+  /** 词组表最长键长度 */
+  #maxlen = 1;
+
   constructor(dataDir = DATA_DIR) {
-    /** @type {Map<string,string>} */
-    this.chars = new Map();
-    /** @type {Map<string,string>} */
-    this.phrases = new Map();
     for (const [file, target] of [
-      ['TSCharacters.txt', this.chars],
-      ['TSPhrases.txt', this.phrases],
+      ['TSCharacters.txt', this.#chars],
+      ['TSPhrases.txt', this.#phrases],
     ]) {
       const p = join(dataDir, file);
       if (!existsSync(p)) continue;
@@ -229,9 +256,9 @@ export class FallbackT2S {
         if (dst.length) target.set(parts[0], dst[0]);
       }
     }
-    let max = 1;
-    for (const k of this.phrases.keys()) if (k.length > max) max = k.length;
-    this.maxlen = max;
+    for (const k of this.#phrases.keys()) {
+      if (k.length > this.#maxlen) this.#maxlen = k.length;
+    }
   }
 
   convert(text) {
@@ -240,10 +267,9 @@ export class FallbackT2S {
     let i = 0;
     while (i < n) {
       let hit = false;
-      if (this.phrases.size) {
-        for (let len = Math.min(this.maxlen, n - i); len > 1; len--) {
-          const cand = text.substr(i, len);
-          const rep = this.phrases.get(cand);
+      if (this.#phrases.size) {
+        for (let len = Math.min(this.#maxlen, n - i); len > 1; len--) {
+          const rep = this.#phrases.get(text.slice(i, i + len));
           if (rep !== undefined) {
             out.push(rep);
             i += len;
@@ -254,7 +280,7 @@ export class FallbackT2S {
       }
       if (hit) continue;
       const ch = text[i];
-      out.push(this.chars.get(ch) ?? ch);
+      out.push(this.#chars.get(ch) ?? ch);
       i += 1;
     }
     return out.join('');
@@ -295,11 +321,10 @@ export async function getConverter(backend = 'auto') {
 /** 合并重叠/相邻区间 */
 function mergeSpans(spans) {
   if (!spans.length) return [];
-  const sorted = [...spans].sort((a, b) => a[0] - b[0] || a[1] - b[1]);
-  const merged = [[sorted[0][0], sorted[0][1]]];
-  for (let k = 1; k < sorted.length; k++) {
-    const [s, e] = sorted[k];
-    const last = merged[merged.length - 1];
+  const sorted = spans.toSorted((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const merged = [[...sorted[0]]];
+  for (const [s, e] of sorted.slice(1)) {
+    const last = merged.at(-1);
     if (s <= last[1]) last[1] = Math.max(last[1], e);
     else merged.push([s, e]);
   }
@@ -320,17 +345,15 @@ export function structuralSpans(text, fmt, protectFrontmatter = true) {
 
   // YAML frontmatter（默认保护：元数据中的半角写法通常是刻意保留的）
   if (md && protectFrontmatter && /^---\r?\n/.test(text)) {
-    const rest = text.slice(3);
-    const m = /\r?\n---[ \t]*(?:\r?\n|$)/.exec(rest);
+    const m = /\r?\n---[ \t]*(?:\r?\n|$)/.exec(text.slice(3));
     if (m) spans.push([0, 3 + m.index + m[0].length]);
   }
 
   // 逐行：围栏代码块 / 表格 / 标题 / 列表 / 引用标记
-  const lines = text.split('\n');
   let pos = 0;
   let inFence = false;
   let fenceTok = null;
-  for (const line of lines) {
+  for (const line of text.split('\n')) {
     const start = pos;
     const end = pos + line.length;
     const stripped = line.trim();
@@ -339,7 +362,7 @@ export function structuralSpans(text, fmt, protectFrontmatter = true) {
       // 连行尾换行符一并保护：空行的 [start,end] 长度为 0，若不覆盖换行符，
       // 代码块内的空行会被后续的空白压缩误删。
       spans.push([start, Math.min(end + 1, text.length)]);
-      if (fm && fm[1] === fenceTok) {
+      if (fm?.[1] === fenceTok) {
         inFence = false;
         fenceTok = null;
       }
@@ -385,9 +408,7 @@ export function structuralSpans(text, fmt, protectFrontmatter = true) {
     '\\$\\$[\\s\\S]+?\\$\\$', // 块级公式
     '(?<!\\$)\\$(?![\\s$])([^$\\n]+?)(?<![\\s])\\$(?!\\$)', // 行内公式
   ];
-  if (md) {
-    inline.push('\\[\\^[^\\]\\n]*\\]', '\\{[^{}\\n]*\\}');
-  }
+  if (md) inline.push('\\[\\^[^\\]\\n]*\\]', '\\{[^{}\\n]*\\}');
   for (const src of inline) {
     for (const m of text.matchAll(new RegExp(src, 'g'))) {
       spans.push([m.index, m.index + m[0].length]);
@@ -396,14 +417,12 @@ export function structuralSpans(text, fmt, protectFrontmatter = true) {
 
   // 链接/图片：仅保护定界符与 URL，链接文字仍参与转换
   if (md) {
-    const re = /(!?)\[([^\]\n]*)\]\(([^)\n]*)\)/gd;
-    for (const m of text.matchAll(re)) {
-      const open = m.indices[2][0]; // [
-      const close = m.indices[2][1]; // ] 之后
+    for (const m of text.matchAll(/(!?)\[([^\]\n]*)\]\(([^)\n]*)\)/gd)) {
+      const [textStart, textEnd] = m.indices[2];
       const urlEnd = m.indices[3][1];
-      spans.push([open - 1, open]); // [
-      spans.push([close, close + 1]); // ]
-      spans.push([close + 1, urlEnd + 1]); // (url)
+      spans.push([textStart - 1, textStart]); // [
+      spans.push([textEnd, textEnd + 1]); // ]
+      spans.push([textEnd + 1, urlEnd + 1]); // (url)
     }
   }
 
@@ -556,7 +575,6 @@ function trailingWord(text, i) {
  * 否则「（中文）." 这类句子末尾的句点会被漏判。
  */
 function decidePunct(text, i, ch, opts, out) {
-  const n = text.length;
   const p = prevChar(text, i);
   const q = nextChar(text, i);
   const pch = p >= 0 ? out[p] : '';
@@ -633,7 +651,7 @@ function decidePunct(text, i, ch, opts, out) {
     return PUNCT_MAP[ch];
   }
 
-  if (Object.prototype.hasOwnProperty.call(SYMBOL_MAP, ch)) {
+  if (Object.hasOwn(SYMBOL_MAP, ch)) {
     if (isDigit(pch) || isDigit(qch) || pcjk || qcjk) return SYMBOL_MAP[ch];
     return null;
   }
@@ -668,8 +686,8 @@ function transformPunctDigits(text, protectedMask, opts, stats) {
 
     if (
       ch === '.' ||
-      Object.prototype.hasOwnProperty.call(PUNCT_MAP, ch) ||
-      (opts.symbols && Object.prototype.hasOwnProperty.call(SYMBOL_MAP, ch))
+      Object.hasOwn(PUNCT_MAP, ch) ||
+      (opts.symbols && Object.hasOwn(SYMBOL_MAP, ch))
     ) {
       if (opts.quotes === 'curly' && (ch === '"' || ch === "'")) {
         const pi = prevChar(text, i);
@@ -695,19 +713,43 @@ function transformPunctDigits(text, protectedMask, opts, stats) {
 
 // ---------------------------------------------------------------- 空白 / 悬空标点
 
-/** 按保护掩码把文本切成连续的 {text, protected, start} 片段 */
-function runsByMask(text, mask) {
-  const runs = [];
+/**
+ * 按保护掩码把文本切成连续的片段。惰性生成，配合迭代器辅助方法使用。
+ * @param {string} text
+ * @param {Uint8Array} mask
+ */
+export function* maskRuns(text, mask) {
   const n = text.length;
   let i = 0;
   while (i < n) {
     const flag = mask[i] ? 1 : 0;
     let j = i;
     while (j < n && (mask[j] ? 1 : 0) === flag) j += 1;
-    runs.push({ text: text.slice(i, j), protected: flag === 1, start: i });
+    yield { text: text.slice(i, j), protected: flag === 1, start: i };
     i = j;
   }
-  return runs;
+}
+
+/** 单个非保护片段的空白收敛（collapseWhitespace 的内部步骤） */
+function collapseRun(run, mode, prevIsNewline) {
+  let s = run.text;
+  if (mode === 'full') {
+    // 行尾空白与文末空白
+    s = s.replace(/[ \t　]+(?=\r?\n|$)/g, '');
+  } else {
+    // 仅清空「空白行」：整行只有空格 / 制表 / 全角空格
+    s = s.replace(/(?<=\r?\n)[ \t　]+(?=\r?\n|$)/g, '');
+    if (run.start === 0) s = s.replace(/^[ \t　]+(?=\r?\n|$)/, '');
+  }
+  s = s.replace(/(?:\r?\n)(?:[ \t　]*\r?\n){2,}/g, (m) =>
+    m.startsWith('\r\n') ? '\r\n\r\n' : '\n\n',
+  );
+  // 若片段紧接在一个换行之后（上一片段结尾不可删），本片段开头的换行
+  // 属于同一串换行：为凑满「至多两个」只保留一个。
+  if (prevIsNewline) {
+    s = s.replace(/^(?:\r?\n){2,}/, (m) => (m.startsWith('\r\n') ? '\r\n' : '\n'));
+  }
+  return s;
 }
 
 /**
@@ -721,40 +763,51 @@ function runsByMask(text, mask) {
  * 受保护区域（代码块等）内的换行原样保留。
  */
 export function collapseWhitespace(text, mask, mode, stats) {
-  if (mode === 'off' || !text.length) return text;
+  if (mode === 'off' || text.length === 0) return text;
 
-  let out = '';
-  for (const run of runsByMask(text, mask)) {
-    if (run.protected) {
-      out += run.text;
-      continue;
-    }
-    let s = run.text;
-    if (mode === 'full') {
-      // 行尾空白与文末空白
-      s = s.replace(/[ \t　]+(?=\r?\n|$)/g, '');
-    } else {
-      // 仅清空「空白行」：整行只有空格 / 制表 / 全角空格
-      s = s.replace(/(?<=\r?\n)[ \t　]+(?=\r?\n|$)/g, '');
-      if (run.start === 0) s = s.replace(/^[ \t　]+(?=\r?\n|$)/, '');
-    }
-    s = s.replace(/(?:\r?\n)(?:[ \t　]*\r?\n){2,}/g, (m) =>
-      m.startsWith('\r\n') ? '\r\n\r\n' : '\n\n',
-    );
-    // 若片段紧接在一个换行之后（上一片段结尾不可删），本片段开头的换行
-    // 属于同一串换行：为凑满「至多两个」只保留一个。
-    if (run.start > 0 && text[run.start - 1] === '\n') {
-      s = s.replace(/^(?:\r?\n){2,}/, (m) => (m.startsWith('\r\n') ? '\r\n' : '\n'));
-    }
-    out += s;
-  }
+  const runs = maskRuns(text, mask).map((run) =>
+    run.protected ? run.text : collapseRun(run, mode, run.start > 0 && text[run.start - 1] === '\n'),
+  );
+  let out = [...runs].join('');
 
   if (!mask[0]) out = out.replace(/^(?:\r?\n)+/, '');
-  if (!mask[text.length - 1]) out = out.replace(/(\r?\n)(?:\r?\n)+$/, '$1');
+  if (!mask.at(-1)) out = out.replace(/(\r?\n)(?:\r?\n)+$/, '$1');
 
   const removed = text.length - out.length;
   if (removed > 0) stats.whitespace += removed;
   return out;
+}
+
+/** 单个非保护片段的悬空标点收敛（removeDanglingPunct 的内部步骤） */
+function collapsePunctRun(s, stats) {
+  let buf = '';
+  let i = 0;
+  while (i < s.length) {
+    if (punctStrength(s[i]) === undefined) {
+      buf += s[i];
+      i += 1;
+      continue;
+    }
+    // 找出一段连续的标点串 [i, j)，取其最高强度
+    let j = i;
+    let max = 0;
+    while (j < s.length) {
+      const st = punctStrength(s[j]);
+      if (st === undefined) break;
+      if (st > max) max = st;
+      j += 1;
+    }
+    let kept = 0;
+    for (let k = i; k < j; k++) {
+      if (punctStrength(s[k]) === max) {
+        buf += s[k];
+        kept += 1;
+      }
+    }
+    stats.dangling += j - i - kept;
+    i = j;
+  }
+  return buf;
 }
 
 /**
@@ -763,44 +816,10 @@ export function collapseWhitespace(text, mask, mode, stats) {
  * - 整串强度相同时原样保留（`！！`、`？！` 这类重复常为有意强调）
  */
 export function removeDanglingPunct(text, mask, stats) {
-  let out = '';
-  for (const run of runsByMask(text, mask)) {
-    if (run.protected) {
-      out += run.text;
-      continue;
-    }
-    const s = run.text;
-    const n = s.length;
-    let buf = '';
-    let i = 0;
-    while (i < n) {
-      if (punctStrength(s[i]) === undefined) {
-        buf += s[i];
-        i += 1;
-        continue;
-      }
-      // 找出一段连续的标点串 [i, j)，取其最高强度
-      let j = i;
-      let max = 0;
-      while (j < n) {
-        const st = punctStrength(s[j]);
-        if (st === undefined) break;
-        if (st > max) max = st;
-        j += 1;
-      }
-      let kept = 0;
-      for (let k = i; k < j; k++) {
-        if (punctStrength(s[k]) === max) {
-          buf += s[k];
-          kept += 1;
-        }
-      }
-      stats.dangling += j - i - kept;
-      i = j;
-    }
-    out += buf;
-  }
-  return out;
+  const runs = maskRuns(text, mask).map((run) =>
+    run.protected ? run.text : collapsePunctRun(run.text, stats),
+  );
+  return [...runs].join('');
 }
 
 // ---------------------------------------------------------------- 通用 diff
@@ -843,8 +862,7 @@ export function diffBlocks(a, b) {
 
   const aMid = A.slice(pre, n - suf);
   const bMid = B.slice(pre, m - suf);
-  const inner = lcsBlocks(aMid, bMid);
-  for (const blk of inner) {
+  for (const blk of lcsBlocks(aMid, bMid)) {
     blocks.push({
       type: blk.type,
       a1: blk.a1 + pre,
@@ -957,9 +975,9 @@ function convertHanzi(text, protectedMask, convert, stats) {
   const converted = convert(buf);
   recordHanziStats(buf, converted, stats); // 必须在还原占位符之前统计
   let result = converted;
-  for (let k = 0; k < spans.length; k++) {
-    const [s, e] = spans[k];
-    result = result.split(holders[k]).join(text.slice(s, e));
+  for (const [k, [s, e]] of spans.entries()) {
+    // 用函数型替换以免被保护文本里的 $& / $1 等被当作替换模式解释
+    result = result.replaceAll(holders[k], () => text.slice(s, e));
   }
   return result;
 }
@@ -1062,17 +1080,17 @@ export function normalizeText(text, opts, convert) {
 
 const BOM = Buffer.from([0xef, 0xbb, 0xbf]);
 
-function readText(path) {
-  const raw = readFileSync(path);
-  const bom = raw.length >= 3 && raw[0] === 0xef && raw[1] === 0xbb && raw[2] === 0xbf;
+async function readText(path) {
+  const raw = await readFile(path);
+  const bom = raw.subarray(0, 3).equals(BOM);
   let text = raw.toString('utf8');
   if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
   return { text, bom };
 }
 
-function writeText(path, text, bom) {
+async function writeText(path, text, bom) {
   const body = Buffer.from(text, 'utf8');
-  writeFileSync(path, bom ? Buffer.concat([BOM, body]) : body);
+  await writeFile(path, bom ? Buffer.concat([BOM, body]) : body);
 }
 
 function detectFormat(path, optsFormat) {
@@ -1085,7 +1103,11 @@ function withSuffix(file, suffix) {
   return suffix.startsWith('.') ? file + suffix : `${file}.${suffix}`;
 }
 
-/** 从 stdin 读取全部文本（同步阻塞，适合 CLI 一次性输入） */
+/**
+ * 从 stdin 读取全部文本。
+ * 刻意用同步读而非流式：stdin 是非 TTY 但无数据时会一直挂起，
+ * readFileSync(0) 则会立刻失败并返回空串。
+ */
 function readStdin() {
   try {
     return readFileSync(0, 'utf8');
@@ -1119,9 +1141,8 @@ function emitDiff(label, before, after) {
   if (before === after) return;
   const a = before.split('\n');
   const b = after.split('\n');
-  const blocks = diffBlocks(a, b).filter((x) => x.type === 'change');
   const lines = [];
-  for (const blk of blocks) {
+  for (const blk of diffBlocks(a, b).filter((x) => x.type === 'change')) {
     const removed = a.slice(blk.a1, blk.a2);
     const added = b.slice(blk.b1, blk.b2);
     lines.push(`@@ -${blk.a1 + 1},${removed.length} +${blk.b1 + 1},${added.length} @@`);
@@ -1137,11 +1158,13 @@ function emitDiff(label, before, after) {
 
 const HELP = `normalize.mjs — 中文文本字形级规范化（Node.js ESM，零依赖）
 
+环境要求: Node.js >= ${MIN_NODE_MAJOR}（官网公示的仍受支持的最低 LTS）
+
 用法:
   node scripts/normalize.mjs [选项] [文件...]
 
 输入（三选一）:
-  --text <文本>              直接处理给出的文本
+  --text <文本>              直接处理给出的文本（文本以 - 开头请用 --text=<文本>）
   --stdin                    从标准输入读取
   <文件...>                  处理文件
 
@@ -1187,141 +1210,121 @@ const HELP = `normalize.mjs — 中文文本字形级规范化（Node.js ESM，�
 退出码: 0 正常 / 1 --check 发现可改动项 / 2 参数或文件错误
 `;
 
-const VALUE_FLAGS = new Set([
-  '--text', '--output', '--suffix', '--format', '--protect', '--protect-name',
-  '--protect-file', '--names-file', '--period', '--quotes', '--backend', '--whitespace',
-]);
-const SHORT_VALUE = { '-o': '--output' };
+/**
+ * CLI 选项表（交给 node:util 的 parseArgs）。
+ * `--no-x` 一律显式声明：parseArgs 的 allowNegative 是 v22.4 才有的，
+ * 直接声明 `--no-x` 键可在整个 v22 线上工作。
+ */
+const CLI_OPTIONS = Object.freeze({
+  help: { type: 'boolean', short: 'h', default: false },
+  version: { type: 'boolean', short: 'V', default: false },
+  'in-place': { type: 'boolean', short: 'i', default: false },
+  stdin: { type: 'boolean', default: false },
+  check: { type: 'boolean', default: false },
+  report: { type: 'boolean', default: false },
+  'report-json': { type: 'boolean', default: false },
+  diff: { type: 'boolean', default: false },
+  symbols: { type: 'boolean', default: false },
+  'convert-frontmatter': { type: 'boolean', default: false },
+  'no-names': { type: 'boolean', default: false },
+  'no-t2s': { type: 'boolean', default: false },
+  'no-punct': { type: 'boolean', default: false },
+  'no-digits': { type: 'boolean', default: false },
+  'no-letters': { type: 'boolean', default: false },
+  'no-dangling': { type: 'boolean', default: false },
+  text: { type: 'string' },
+  output: { type: 'string', short: 'o' },
+  suffix: { type: 'string' },
+  format: { type: 'string', default: 'auto' },
+  period: { type: 'string', default: 'ideographic' },
+  quotes: { type: 'string', default: 'fullwidth' },
+  whitespace: { type: 'string', default: 'blank' },
+  backend: { type: 'string', default: 'auto' },
+  protect: { type: 'string' },
+  'protect-name': { type: 'string', multiple: true, default: [] },
+  'protect-file': { type: 'string' },
+  'names-file': { type: 'string' },
+});
 
-/** 极简参数解析（不引入第三方依赖） */
-export function parseArgs(argv) {
-  const opts = {
-    files: [],
-    text: null,
-    stdin: false,
-    inPlace: false,
-    output: null,
-    suffix: null,
-    check: false,
-    report: false,
-    reportJson: false,
-    diff: false,
-    format: 'auto',
-    protect: null,
-    protectNames: [],
-    protectFile: null,
-    namesFile: null,
-    protectFrontmatter: true,
-    useNames: true,
-    doT2s: true,
-    doPunct: true,
-    doDigits: true,
-    doLetters: true,
-    doDangling: true,
-    whitespace: 'blank',
-    period: 'ideographic',
-    quotes: 'fullwidth',
-    symbols: false,
-    backend: 'auto',
-    help: false,
-    version: false,
+/**
+ * 解析命令行参数。未知选项 / 缺值由 parseArgs 抛出，交由 main 转成退出码 2。
+ * @param {string[]} argv
+ */
+export function parseCliArgs(argv) {
+  const { values, positionals } = parseArgv({
+    args: argv,
+    options: CLI_OPTIONS,
+    allowPositionals: true,
+  });
+
+  return {
+    files: positionals,
+    text: values.text ?? null,
+    stdin: values.stdin,
+    inPlace: values['in-place'],
+    output: values.output ?? null,
+    suffix: values.suffix ?? null,
+    check: values.check,
+    report: values.report,
+    reportJson: values['report-json'],
+    diff: values.diff,
+    format: values.format,
+    protect: values.protect ?? null,
+    protectNames: [...values['protect-name']],
+    protectFile: values['protect-file'] ?? null,
+    namesFile: values['names-file'] ?? null,
+    protectFrontmatter: !values['convert-frontmatter'],
+    useNames: !values['no-names'],
+    doT2s: !values['no-t2s'],
+    doPunct: !values['no-punct'],
+    doDigits: !values['no-digits'],
+    doLetters: !values['no-letters'],
+    doDangling: !values['no-dangling'],
+    whitespace: values.whitespace,
+    period: values.period,
+    quotes: values.quotes,
+    symbols: values.symbols,
+    backend: values.backend,
+    help: values.help,
+    version: values.version,
   };
-
-  for (let i = 0; i < argv.length; i++) {
-    const arg = argv[i];
-    if (arg === '--') {
-      opts.files.push(...argv.slice(i + 1));
-      break;
-    }
-    if (arg === '-h' || arg === '--help') {
-      opts.help = true;
-      continue;
-    }
-    if (arg === '-V' || arg === '--version') {
-      opts.version = true;
-      continue;
-    }
-    if (arg === '-i' || arg === '--in-place') {
-      opts.inPlace = true;
-      continue;
-    }
-    if (arg === '--stdin') {
-      opts.stdin = true;
-      continue;
-    }
-    if (arg === '--check') { opts.check = true; continue; }
-    if (arg === '--report') { opts.report = true; continue; }
-    if (arg === '--report-json') { opts.reportJson = true; continue; }
-    if (arg === '--diff') { opts.diff = true; continue; }
-    if (arg === '--symbols') { opts.symbols = true; continue; }
-
-    let name = arg;
-    let value = null;
-    if (SHORT_VALUE[arg]) name = SHORT_VALUE[arg];
-
-    if (arg.startsWith('--') && arg.includes('=')) {
-      const eq = arg.indexOf('=');
-      name = arg.slice(0, eq);
-      value = arg.slice(eq + 1);
-    } else if (VALUE_FLAGS.has(name)) {
-      i += 1;
-      if (i >= argv.length) {
-        throw new Error(`选项 ${name} 缺少取值`);
-      }
-      value = argv[i];
-    }
-
-    switch (name) {
-      case '--text': opts.text = value; break;
-      case '--output': opts.output = value; break;
-      case '--suffix': opts.suffix = value; break;
-      case '--format': opts.format = value; break;
-      case '--protect': opts.protect = value; break;
-      case '--protect-name': opts.protectNames.push(value); break;
-      case '--protect-file': opts.protectFile = value; break;
-      case '--names-file': opts.namesFile = value; break;
-      case '--period': opts.period = value; break;
-      case '--quotes': opts.quotes = value; break;
-      case '--backend': opts.backend = value; break;
-      case '--whitespace': opts.whitespace = value; break;
-      case '--no-names': opts.useNames = false; break;
-      case '--no-t2s': opts.doT2s = false; break;
-      case '--no-punct': opts.doPunct = false; break;
-      case '--no-digits': opts.doDigits = false; break;
-      case '--no-letters': opts.doLetters = false; break;
-      case '--no-dangling': opts.doDangling = false; break;
-      case '--convert-frontmatter': opts.protectFrontmatter = false; break;
-      default:
-        if (arg.startsWith('-')) throw new Error(`未知选项: ${arg}`);
-        opts.files.push(arg);
-    }
-  }
-  return opts;
 }
 
 /** 校验选项取值，非法时抛出 */
 function validateOptions(opts) {
-  if (!['auto', 'md', 'text'].includes(opts.format)) {
-    throw new Error(`--format 取值非法: ${opts.format}`);
-  }
-  if (!['ideographic', 'fullwidth', 'keep'].includes(opts.period)) {
-    throw new Error(`--period 取值非法: ${opts.period}`);
-  }
-  if (!['fullwidth', 'curly', 'keep'].includes(opts.quotes)) {
-    throw new Error(`--quotes 取值非法: ${opts.quotes}`);
-  }
-  if (!['auto', 'builtin', 'opencc'].includes(opts.backend)) {
-    throw new Error(`--backend 取值非法: ${opts.backend}`);
-  }
-  if (!WHITESPACE_MODES.includes(opts.whitespace)) {
-    throw new Error(`--whitespace 取值非法: ${opts.whitespace}`);
+  const allowed = {
+    '--format': ['auto', 'md', 'text'],
+    '--period': ['ideographic', 'fullwidth', 'keep'],
+    '--quotes': ['fullwidth', 'curly', 'keep'],
+    '--backend': ['auto', 'builtin', 'opencc'],
+    '--whitespace': ['blank', 'full', 'off'],
+  };
+  const keyOf = {
+    '--format': opts.format,
+    '--period': opts.period,
+    '--quotes': opts.quotes,
+    '--backend': opts.backend,
+    '--whitespace': opts.whitespace,
+  };
+  for (const [flag, list] of Object.entries(allowed)) {
+    if (!list.includes(keyOf[flag])) {
+      throw new Error(`${flag} 取值非法: ${keyOf[flag]}（可选 ${list.join('|')}）`, {
+        cause: { flag, value: keyOf[flag] },
+      });
+    }
   }
 }
 
 export async function main(argv = process.argv.slice(2)) {
+  const runtime = checkRuntime();
+  if (!runtime.ok) {
+    process.stderr.write(`[error] ${runtime.message}\n`);
+    return 2;
+  }
+
   let opts;
   try {
-    opts = parseArgs(argv);
+    opts = parseCliArgs(argv);
   } catch (err) {
     process.stderr.write(`[error] ${err.message}\n`);
     return 2;
@@ -1331,7 +1334,7 @@ export async function main(argv = process.argv.slice(2)) {
     return 0;
   }
   if (opts.version) {
-    process.stdout.write(`normalize.mjs ${VERSION}\n`);
+    process.stdout.write(`normalize.mjs ${VERSION} (node ${process.versions.node})\n`);
     return 0;
   }
   try {
@@ -1354,8 +1357,7 @@ export async function main(argv = process.argv.slice(2)) {
         process.stderr.write(`[error] 文件不存在: ${f}\n`);
         return 2;
       }
-      const { text, bom } = readText(f);
-      items.push({ label: f, text, bom });
+      items.push({ label: f, ...(await readText(f)) });
     }
   } else {
     process.stdout.write(HELP);
@@ -1387,10 +1389,10 @@ export async function main(argv = process.argv.slice(2)) {
     if (opts.check) continue;
     if (opts.inPlace || opts.suffix) {
       const target = opts.inPlace ? item.label : withSuffix(item.label, opts.suffix);
-      writeText(target, result, item.bom);
+      await writeText(target, result, item.bom);
       process.stderr.write(`[written] ${target}\n`);
     } else if (opts.output) {
-      writeText(opts.output, result, item.bom);
+      await writeText(opts.output, result, item.bom);
       process.stderr.write(`[written] ${opts.output}\n`);
     } else {
       process.stdout.write(result);
@@ -1402,7 +1404,7 @@ export async function main(argv = process.argv.slice(2)) {
 }
 
 const invokedDirectly =
-  process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url;
+  process.argv[1] !== undefined && resolve(process.argv[1]) === import.meta.filename;
 
 if (invokedDirectly) {
   main().then(

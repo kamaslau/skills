@@ -3,7 +3,14 @@
 本文件是 `scripts/normalize.mjs` 的行为规格说明，供排查「某处为什么没转换 / 为什么被转换」时查阅。
 修改脚本行为前请先阅读本文，并同步更新 `scripts/selftest.mjs` 中的用例。
 
-运行环境：Node.js >= 18，ESM，零第三方依赖（`opencc-js` 为可选增强）。
+运行环境：**Node.js >= 22**（官网公示的仍受支持的最低 LTS；v20 及以下已 EOL），
+ESM，零第三方依赖（`opencc-js` 为可选增强）。
+
+版本下限由 `package.json` 的 `engines.node` 与脚本内 `checkRuntime()` 双重声明，
+后者在版本不足时报错退出（码 2）。因此可用到 v22.0.0 就存在的特性：
+`node:util` `parseArgs`、`import.meta.dirname/filename`、`toSorted`、`replaceAll`、
+`Object.hasOwn`、生成器与迭代器辅助。**不可用** `parseArgs` 的 `allowNegative`
+（v22.4.0 才引入）——`--no-*` 开关一律以显式键名声明。
 
 ## 1. 数字
 
@@ -158,9 +165,14 @@ Markdown 结构（`--format md`，`.md/.markdown/.mdx` 自动识别）：
 ## 9. 回归测试
 
 ```bash
-node scripts/selftest.mjs              # 内置字表 + opencc-js（若已安装）各跑一遍
+npm test                               # 内置字表 + opencc-js（若已安装）各跑一遍
+node scripts/selftest.mjs              # 直接运行，输出 TAP
 node scripts/selftest.mjs --only-builtin
 node scripts/selftest.mjs --only-opencc
 ```
 
-两个后端都需全绿。新增规则时，先在 `CASES` 中补一条 `[名称, 输入, 期望输出, 额外选项]`。
+测试基于 `node:test` + `node:assert/strict`，按后端分组为 `describe`，每条用例一个
+`test`。用例名附带该条改动的统计（数字/标点/字母/空白/悬空/繁简），便于对照。
+
+两个后端都需全绿。新增规则时，先在 `CASES` 中补一条 `[名称, 输入, 期望输出, 额外选项]`；
+改动 CLI 参数时同步更新 `describe('CLI 参数解析')` 中的断言。

@@ -3,7 +3,7 @@ name: text-normalize-zh-hans
 repo: https://github.com/kamaslau/skills
 description: "中文文本字形级规范化：全角阿拉伯数字转半角、半角标点转全角、非简体中文字符转简体（日语/韩语/朝鲜语人名例外），严禁润色或改写语法。当用户提到「文字处理」「文本规范化」「排版清理」「繁转简」「全角半角」「标点全角化」「数字半角化」，或粘贴一段中英混排、繁简混排的文本要求处理时，应使用本技能。适用于 .txt/.md 等文件与对话中的文本片段。"
 allowed-tools: Bash, Read, Edit
-version: 2.1.0
+version: 2.2.0
 agent_created: true
 ---
 
@@ -26,7 +26,11 @@ agent_created: true
 
 ## 运行环境
 
-仅需 **Node.js >= 18**（用到 `String.prototype.matchAll`、正则后行断言、RegExp `/d` indices）。无 npm 依赖、可离线运行。
+需要 **Node.js >= 22**。该下限取自 Node.js 官网公示的**仍受支持的最低 LTS**（v22「Jod」；v20 及以下已 EOL），见 <https://nodejs.org/zh-cn/about/previous-releases>。
+
+`package.json` 的 `engines.node` 与脚本内的 `checkRuntime()` 双重声明该下限；版本过低时脚本直接报错退出（退出码 2），不会静默跑出错误结果。
+
+无 npm 依赖、可离线运行。用到的语言/标准库特性均落在 v22.0.0：`node:util` 的 `parseArgs`、`import.meta.dirname`、`Array.prototype.toSorted`、`String.prototype.replaceAll`、`Object.hasOwn`、生成器 + 迭代器辅助（`.map()`）。刻意**不**使用 `parseArgs` 的 `allowNegative`——它是 v22.4.0 才引入的，用了就得把下限抬到 22.4。
 
 ## 工作流
 
@@ -104,8 +108,11 @@ node scripts/normalize.mjs <文件> --backend builtin   # 强制用内置字表
 
 `--report` 的 `backend=` 字段会显示本次实际使用的后端，便于审计。
 
+回归测试基于 `node:test`（标准库，无额外依赖）：
+
 ```bash
-node scripts/selftest.mjs              # 回归测试（内置字表 + opencc-js 各跑一遍）
+npm test                                       # 内置字表 + opencc-js 各跑一遍，输出简洁
+node scripts/selftest.mjs                      # 直接运行，输出 TAP
 node scripts/selftest.mjs --only-builtin
 node scripts/selftest.mjs --only-opencc
 ```
@@ -135,4 +142,5 @@ node scripts/selftest.mjs --only-opencc
 - 全角英文字母属于中文语境信号：`見附錄Ａ.` 会转成 `見附錄A。`（附录 A 后的句点按中文处理）。
 - 悬空标点只处理**全角**标点，英文的 `?!`、`...` 不受影响。
 - 全程按 UTF-16 码元索引处理；本工具关心的字符均在 BMP，行为与按码点处理一致。
+- `--text` 的取值若以 `-` 开头，必须写成 `--text=-甲`（`parseArgs` 的约束：`--text -甲` 会被判定为缺值）。
 - 完整映射表与判定细节见 `references/rules.md`。

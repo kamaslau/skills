@@ -20,9 +20,7 @@ npx skills add https://github.com/kamaslau/skills/tree/main/skills/text-normaliz
 
 | 技能 | 说明 | 安装 |
 | --- | --- | --- |
-| 技能 | 说明 | 安装 |
-| --- | --- | --- |
-| [`text-normalize-zh-hans`](skills/text-normalize-zh-hans/) | 中文文本字形级规范化：全角阿拉伯数字转半角、半角标点转全角、非简体中文字符转简体（日语/韩语/朝鲜语人名例外）。不润色、不改写语法。需要 Node.js >= 18，无 npm 依赖。 | `npx skills add kamaslau/skills --skill text-normalize-zh-hans` |
+| [`text-normalize-zh-hans`](skills/text-normalize-zh-hans/) | 中文文本字形级规范化：全角阿拉伯数字与英文字母转半角、半角标点转全角、非简体中文字符转简体（日语/韩语/朝鲜语人名例外），并清理冗余空字符与悬空标点。不润色、不改写语法。需要 Node.js >= 22（官网公示的最低 LTS），无 npm 依赖。 | `npx skills add kamaslau/skills --skill text-normalize-zh-hans` |
 
 ## 仓库结构
 

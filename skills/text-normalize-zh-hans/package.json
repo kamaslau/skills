@@ -1,0 +1,13 @@
+{
+  "name": "text-normalize-zh-hans",
+  "version": "2.2.0",
+  "description": "中文文本字形级规范化：全角数字/字母转半角、半角标点转全角、繁转简（日韩人名例外）",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test --test-reporter=spec scripts/selftest.mjs"
+  }
+}

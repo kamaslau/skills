@@ -1,21 +1,40 @@
 #!/usr/bin/env node
 /**
- * selftest.mjs — normalize.mjs 回归测试
+ * selftest.mjs — normalize.mjs 回归测试（基于 node:test）
  *
  * 运行：
- *   node scripts/selftest.mjs              内置字表 + opencc-js（若已安装）双后端
- *   node scripts/selftest.mjs --only-builtin  只跑内置字表后端
- *   node scripts/selftest.mjs --only-opencc   只跑 opencc-js 后端
+ *   node --test --test-reporter=spec scripts/selftest.mjs   推荐，输出简洁
+ *   node scripts/selftest.mjs                               直接运行，输出 TAP
+ *   node scripts/selftest.mjs --only-builtin                只跑内置字表后端
+ *   node scripts/selftest.mjs --only-opencc                 只跑 opencc-js 后端
+ *
+ * 退出码：0 全通过 / 1 有用例失败 / 2 环境或后端不可用
  *
  * 覆盖：全角数字、半角标点、小数点/时间/千分位/缩写、繁转简、日韩人名保护、
- *       Markdown 语法保护、URL/邮箱/路径保护、不润色约束。
+ *       Markdown 语法保护、URL/邮箱/路径保护、CLI 参数解析、不润色约束。
  */
 
-import { FallbackT2S, getConverter, loadNames, normalizeText } from './normalize.mjs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import assert from 'node:assert/strict';
+import { describe, test } from 'node:test';
+import { parseArgs } from 'node:util';
+import { join } from 'node:path';
 
-const SKILL_DIR = join(dirname(fileURLToPath(import.meta.url)), '..');
+import {
+  FallbackT2S,
+  checkRuntime,
+  getConverter,
+  loadNames,
+  normalizeText,
+  parseCliArgs,
+} from './normalize.mjs';
+
+const SKILL_DIR = join(import.meta.dirname, '..');
+
+const runtime = checkRuntime();
+if (!runtime.ok) {
+  console.error(`[error] ${runtime.message}`);
+  process.exit(2);
+}
 
 const CASES = [
   // (名称, 输入, 期望输出, 额外选项)
@@ -103,76 +122,104 @@ function buildOpts(extra) {
   return { ...BASE_OPTS, ...extra, protectNames: [...(extra.protectNames ?? [])] };
 }
 
-async function runSuite(label, convert) {
-  const names = loadNames(null);
-  let failures = 0;
-  for (const [name, src, expect, extra] of CASES) {
-    const opts = buildOpts({
-      ...extra,
-      format: MD_CASES.has(name) ? 'md' : 'text',
-      names,
-    });
-    const { text: got, stats } = normalizeText(src, opts, convert);
-    if (got !== expect) {
-      failures += 1;
-      console.log(`[FAIL] ${name}`);
-      console.log(`       输入: ${JSON.stringify(src)}`);
-      console.log(`       期望: ${JSON.stringify(expect)}`);
-      console.log(`       实际: ${JSON.stringify(got)}`);
-    } else {
-      const more = [];
-      if (stats.letters) more.push(`字母${stats.letters}`);
-      if (stats.whitespace) more.push(`空白${stats.whitespace}`);
-      if (stats.dangling) more.push(`悬空${stats.dangling}`);
-      console.log(
-        `[ ok ] ${name}  (数字${stats.digits}/标点${stats.punct}` +
-          `${more.length ? '/' + more.join('/') : ''}/繁简${stats.hanzi})`,
-      );
-    }
-  }
-  console.log(`\n[${label}] 结果: ${CASES.length - failures}/${CASES.length} 通过`);
-  return failures;
-}
-
-async function main() {
-  const argv = process.argv.slice(2);
-  const onlyBuiltin = argv.includes('--only-builtin');
-  const onlyOpencc = argv.includes('--only-opencc');
-
-  let failures = 0;
-  let suites = 0;
-
+/** 收集本次要跑的后端 */
+async function resolveBackends(onlyBuiltin, onlyOpencc) {
+  const backends = [];
   if (!onlyOpencc) {
     const table = new FallbackT2S(join(SKILL_DIR, 'data'));
-    console.log('backend = builtin-table\n');
-    failures += await runSuite('builtin-table', (s) => table.convert(s));
-    suites += 1;
-    console.log('');
+    backends.push({ label: 'builtin-table', convert: (s) => table.convert(s) });
   }
-
   if (!onlyBuiltin) {
-    // 用 auto：opencc-js 装了就跑它，没装就静默回退（此处据此跳过）
+    // auto：装了 opencc-js 就跑它，没装则静默跳过
     const { convert, name } = await getConverter('auto');
-    if (name !== 'opencc-js') {
-      console.log('backend = opencc-js 未安装，跳过（可 npm i opencc-js 以启用该后端）');
-    } else {
-      console.log('backend = opencc-js\n');
-      failures += await runSuite('opencc-js', convert);
-      suites += 1;
-    }
+    if (name === 'opencc-js') backends.push({ label: 'opencc-js', convert });
+    else console.log('opencc-js 未安装，跳过（npm i opencc-js 可启用该后端）');
   }
-
-  if (suites === 0) {
-    console.log('[error] 没有可运行的后端');
-    return 2;
-  }
-  return failures ? 1 : 0;
+  return backends;
 }
 
-main().then(
-  (code) => process.exit(code),
-  (err) => {
-    console.error(err);
-    process.exit(2);
+const { values: cli } = parseArgs({
+  options: {
+    'only-builtin': { type: 'boolean', default: false },
+    'only-opencc': { type: 'boolean', default: false },
   },
-);
+});
+
+const backends = await resolveBackends(cli['only-builtin'], cli['only-opencc']);
+if (!backends.length) {
+  console.error('[error] 没有可运行的后端');
+  process.exit(2);
+}
+
+const names = loadNames(null);
+
+for (const { label, convert } of backends) {
+  describe(`backend = ${label}`, () => {
+    for (const [name, src, expect, extra] of CASES) {
+      const opts = buildOpts({
+        ...extra,
+        format: MD_CASES.has(name) ? 'md' : 'text',
+        names,
+      });
+      // 转换是同步的，先算出结果，好把统计信息写进用例名
+      const { text: got, stats } = normalizeText(src, opts, convert);
+      const detail = [
+        `数字${stats.digits}`,
+        `标点${stats.punct}`,
+        ...(stats.letters ? [`字母${stats.letters}`] : []),
+        ...(stats.whitespace ? [`空白${stats.whitespace}`] : []),
+        ...(stats.dangling ? [`悬空${stats.dangling}`] : []),
+        `繁简${stats.hanzi}`,
+      ].join('/');
+
+      test(`${name}  (${detail})`, () => {
+        assert.equal(got, expect);
+      });
+    }
+  });
+}
+
+describe('CLI 参数解析', () => {
+  test('位置参数作为文件', () => {
+    const o = parseCliArgs(['a.md', 'b.md']);
+    assert.deepEqual(o.files, ['a.md', 'b.md']);
+  });
+
+  test('--text 与等号写法', () => {
+    assert.equal(parseCliArgs(['--text', '甲']).text, '甲');
+    assert.equal(parseCliArgs(['--text=-甲']).text, '-甲');
+  });
+
+  test('--no-* 取反', () => {
+    const o = parseCliArgs(['--no-t2s', '--no-letters', '--no-names']);
+    assert.equal(o.doT2s, false);
+    assert.equal(o.doLetters, false);
+    assert.equal(o.useNames, false);
+    assert.equal(parseCliArgs([]).doT2s, true);
+  });
+
+  test('--protect-name 可重复', () => {
+    const o = parseCliArgs(['--protect-name', '甲', '--protect-name', '乙']);
+    assert.deepEqual(o.protectNames, ['甲', '乙']);
+  });
+
+  test('短选项与默认值', () => {
+    const o = parseCliArgs(['-i', '-o', 'out.txt']);
+    assert.equal(o.inPlace, true);
+    assert.equal(o.output, 'out.txt');
+    assert.equal(o.whitespace, 'blank');
+    assert.equal(o.backend, 'auto');
+  });
+
+  test('-- 之后全部视为文件', () => {
+    assert.deepEqual(parseCliArgs(['--', '--bogus']).files, ['--bogus']);
+  });
+
+  test('未知选项抛错', () => {
+    assert.throws(() => parseCliArgs(['--bogus']), /Unknown option/);
+  });
+
+  test('缺取值抛错', () => {
+    assert.throws(() => parseCliArgs(['--text']), /argument missing/);
+  });
+});
