@@ -145,9 +145,18 @@ Markdown 结构（`--format md`，`.md/.markdown/.mdx` 自动识别）：
 
 ## 8. I/O 约定
 
-- 编码 UTF-8；BOM 与 CRLF/LF 行尾原样保留；不改变文件末尾换行状态。
+- **输入**：自动探测编码，支持 UTF-8 / UTF-16 / GB18030 / Big5 / EUC-KR / Shift_JIS；
+  `--input-encoding` 可强制指定（取值在进入主流程前用 `new TextDecoder()` 校验）。
+  探测实现见 `scripts/encoding.mjs`，原理见 `references/utf8-script-ranges.md` 第 5 节。
+- **输出**：恒为 UTF-8；CRLF/LF 行尾原样保留；写文件时保证以单个换行结尾。
+  BOM 由 `--bom keep|strip|add` 控制，默认 `keep`（沿用输入是否有 BOM）。
+- **输出路径**：恒为 `.md`。`-o` 替换扩展名（`out.txt` → `out.md`）；`--suffix` 保留
+  用户后缀再追加（`.norm` → `a.norm.md`）；文件输入默认写 `a.txt` → `a.md`、
+  `a.md` → `a.normalized.md`；`--stdout` 强制只打印。
 - 统计与 diff 输出到 stderr，转换结果输出到 stdout，两者可安全分离重定向。
 - 批量处理多个文件必须显式指定 `--in-place` 或 `--suffix`，避免误写。
+- stdin 用 `readSync` 循环读原始字节：既避免 `readFileSync(0)` 在部分平台只返回首个
+  分片，也避免 `process.stdin` 异步迭代先按 UTF-8 解码而破坏非 UTF-8 字节。
 
 ### 执行顺序（硬约束）
 

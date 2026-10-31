@@ -8,6 +8,8 @@
  *   2. 全角阿拉伯数字（U+FF10–U+FF19）→ 半角阿拉伯数字（0–9）。
  *   3. 半角标点符号 → 全角标点符号（上下文感知，避免破坏小数点/时间/代码/URL/缩写）。
  *   4. 非简体中文字符 → 简体中文字符（日语、韩语、朝鲜语人名除外）。
+ *   5. 输出恒定 UTF-8 编码的 Markdown 文件：输入可为 UTF-8 / UTF-16 /
+ *      GB18030 / Big5 / EUC-KR / Shift_JIS，探测后解码，再以 UTF-8 写出 .md。
  *
  * 运行环境：Node.js >= 22（v22「Jod」是 nodejs.org 公示的**仍受支持的最低 LTS**；
  * v20 及以下已 EOL）。所依赖的语言与标准库特性：
@@ -24,16 +26,26 @@
  * 因此行为一致。
  */
 
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readSync } from 'node:fs';
 import { readFile, writeFile } from 'node:fs/promises';
 import { join, extname, resolve } from 'node:path';
 import { parseArgs as parseArgv } from 'node:util';
+
+import {
+  appendMarkdownExt,
+  decodeBuffer,
+  defaultOutputPath,
+  encodeUtf8,
+  ensureMarkdownPath,
+  formatScriptTable,
+  MD_EXTS,
+} from './encoding.mjs';
 
 const SCRIPT_DIR = import.meta.dirname;
 const SKILL_DIR = join(SCRIPT_DIR, '..');
 const DATA_DIR = join(SKILL_DIR, 'data');
 
-const VERSION = '2.2.0';
+const VERSION = '2.3.0';
 
 /** 最低 Node 版本：nodejs.org 公示的仍受支持的最低 LTS 主版本号 */
 const MIN_NODE_MAJOR = 22;
@@ -998,7 +1010,9 @@ function collectExtraNames(opts) {
     if (t) extra.add(t);
   }
   if (opts.protectFile && existsSync(opts.protectFile)) {
-    for (const line of readFileSync(opts.protectFile, 'utf8').split(/\r?\n/)) {
+    // 保护名单文件同样走编码探测，避免用户给的是 GB18030 名单
+    const raw = decodeBuffer(readFileSync(opts.protectFile)).text;
+    for (const line of raw.split(/\r?\n/)) {
       const t = line.trim();
       if (t && !t.startsWith('#')) extra.add(t);
     }
@@ -1078,19 +1092,41 @@ export function normalizeText(text, opts, convert) {
 
 // ---------------------------------------------------------------- 文件 I/O
 
-const BOM = Buffer.from([0xef, 0xbb, 0xbf]);
-
-async function readText(path) {
+/**
+ * 读入文件：字节 → 探测编码 → 解码为字符串。
+ * 输入可以是 UTF-8 / UTF-16 / GB18030 / Big5 / EUC-KR / Shift_JIS；
+ * 输出恒为 UTF-8，因此这里必须先把输入正确解码，否则「乱码进、乱码出」。
+ * @param {string} path
+ * @param {string|null} inputEncoding --input-encoding 显式指定时跳过探测
+ */
+async function readText(path, inputEncoding = null) {
   const raw = await readFile(path);
-  const bom = raw.subarray(0, 3).equals(BOM);
-  let text = raw.toString('utf8');
-  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
-  return { text, bom };
+  const info = decodeBuffer(raw, inputEncoding);
+  // TextDecoder 默认会剥掉 BOM，此处仅记录它是否存在，供 --bom keep 复现
+  return {
+    text: info.text,
+    bom: info.bom,
+    encoding: info.encoding,
+    encodingConfidence: info.confidence,
+  };
 }
 
+/** BOM 策略：keep = 输入有则保留；strip = 一律去掉；add = 一律加上 */
+function resolveBom(policy, hadBom) {
+  if (policy === 'strip') return false;
+  if (policy === 'add') return true;
+  return hadBom;
+}
+
+/** 输出恒为 UTF-8。Content 结尾保证有换行（Markdown 文件的基本形态）。 */
 async function writeText(path, text, bom) {
-  const body = Buffer.from(text, 'utf8');
-  await writeFile(path, bom ? Buffer.concat([BOM, body]) : body);
+  await writeFile(path, encodeUtf8(ensureTrailingNewline(text), bom));
+}
+
+/** 文本以换行结尾；缺失时补上，并沿用正文已有的行尾风格（LF / CRLF） */
+function ensureTrailingNewline(text) {
+  if (!text || text.endsWith('\n')) return text;
+  return text + (text.includes('\r\n') ? '\r\n' : '\n');
 }
 
 function detectFormat(path, optsFormat) {
@@ -1104,33 +1140,62 @@ function withSuffix(file, suffix) {
 }
 
 /**
- * 从 stdin 读取全部文本。
- * 刻意用同步读而非流式：stdin 是非 TTY 但无数据时会一直挂起，
- * readFileSync(0) 则会立刻失败并返回空串。
+ * 从 stdin 读取全部字节并解码（同样走编码探测，可管道输入 GB18030 等）。
+ *
+ * stdin 的读法有两个坑：
+ *   - `readFileSync(0)` 在部分平台（含 Windows 上被代理的 fs shim）只返回首个分片；
+ *   - `for await (const c of process.stdin)` 默认按 UTF-8 解码，非 UTF-8 字节会被
+ *     替换成 U+FFFD，后续编码探测与转码就没机会做了。
+ * 因此用 `readSync` 循环读原始字节；代价是「非 TTY 但无数据」时会阻塞，故先判 isTTY。
+ * @param {string|null} inputEncoding
  */
-function readStdin() {
-  try {
-    return readFileSync(0, 'utf8');
-  } catch {
-    return '';
+function readStdin(inputEncoding = null) {
+  if (process.stdin.isTTY) {
+    throw new Error('--stdin 需要管道输入（或改用 --text / 文件路径）');
   }
+  const chunks = [];
+  const buf = Buffer.alloc(1 << 16);
+  let spins = 0;
+  for (;;) {
+    let n;
+    try {
+      n = readSync(0, buf, 0, buf.length, null);
+    } catch (err) {
+      const code = err?.code;
+      // EOF：Windows 管道读到末尾；EAGAIN/EINTR：重试但避免无数据时空转
+      if (code === 'EOF' || code === 'EPIPE') break;
+      if ((code === 'EAGAIN' || code === 'EINTR') && ++spins < 10000) continue;
+      throw err;
+    }
+    if (n === 0) break;
+    spins = 0;
+    chunks.push(Buffer.from(buf.subarray(0, n)));
+  }
+  const info = decodeBuffer(Buffer.concat(chunks), inputEncoding);
+  return {
+    text: info.text,
+    bom: info.bom,
+    encoding: info.encoding,
+    encodingConfidence: info.confidence,
+  };
 }
 
 // ---------------------------------------------------------------- 输出
 
-function emitReport(label, stats, backend, asJson) {
+function emitReport(label, stats, backend, asJson, enc = null) {
   const total =
     stats.digits + stats.letters + stats.punct + stats.whitespace + stats.dangling + stats.hanzi;
+  const encTag = enc ? ` (${enc.encoding}${enc.confidence === 'high' ? '' : `, ${enc.confidence}`})` : '';
   if (asJson) {
     process.stderr.write(
-      `${JSON.stringify({ target: label, backend, total, ...stats }, null, 0)}\n`,
+      `${JSON.stringify({ target: label, backend, total, inputEncoding: enc, ...stats }, null, 0)}\n`,
     );
     return;
   }
   process.stderr.write(
     `[report] ${label}: 数字 ${stats.digits} / 字母 ${stats.letters} / 标点 ${stats.punct} / ` +
       `空白 ${stats.whitespace} / 悬空标点 ${stats.dangling} / 繁简 ${stats.hanzi} ` +
-      `/ 共 ${total} 处  (backend=${backend})\n`,
+      `/ 共 ${total} 处  (backend=${backend})${encTag}\n`,
   );
   for (const ex of stats.examples.slice(0, 12)) {
     process.stderr.write(`         繁简示例: ${ex.from} → ${ex.to}\n`);
@@ -1167,12 +1232,18 @@ const HELP = `normalize.mjs — 中文文本字形级规范化（Node.js ESM，�
   --text <文本>              直接处理给出的文本（文本以 - 开头请用 --text=<文本>）
   --stdin                    从标准输入读取
   <文件...>                  处理文件
+  --input-encoding <编码>    强制指定输入编码（默认自动探测，见下）
 
-输出:
-  (默认)                     输出到 stdout
-  -i, --in-place             原地覆盖写回文件
-  -o, --output <文件>        写入指定文件（单输入）
-  --suffix <后缀>            批量输出，如 .norm → a.md.norm
+输出（恒为 UTF-8 编码的 Markdown 文件）:
+  (默认)                     文件输入写出同名 .md：a.txt → a.md，a.md → a.normalized.md
+  -i, --in-place             原地覆盖写回原文件（唯一可能保持非 .md 扩展名的模式）
+  -o, --output <文件>        写入指定文件（扩展名强制为 .md）
+  --suffix <后缀>            批量输出，如 .norm → a.norm.md
+  --stdout                   强制输出到 stdout，不写文件
+  --bom keep|strip|add       UTF-8 BOM 策略，默认 keep（沿用输入是否有 BOM）
+
+输入编码自动探测顺序：BOM → 严格 UTF-8 合法性 → UTF-16 空字节模式
+  → GB18030/Big5/EUC-KR/Shift_JIS 字频打分。非 UTF-8 输入会被转码为 UTF-8 输出。
 
 报告:
   --check                    只报告不改动；有可改项时退出码 1
@@ -1206,6 +1277,7 @@ const HELP = `normalize.mjs — 中文文本字形级规范化（Node.js ESM，�
 其他:
   -h, --help                 显示帮助
   -V, --version              显示版本
+  --print-scripts            打印「书写系统 ↔ 码点区间 ↔ UTF-8 字节区间」对照表
 
 退出码: 0 正常 / 1 --check 发现可改动项 / 2 参数或文件错误
 `;
@@ -1232,6 +1304,8 @@ const CLI_OPTIONS = Object.freeze({
   'no-digits': { type: 'boolean', default: false },
   'no-letters': { type: 'boolean', default: false },
   'no-dangling': { type: 'boolean', default: false },
+  'print-scripts': { type: 'boolean', default: false },
+  stdout: { type: 'boolean', default: false },
   text: { type: 'string' },
   output: { type: 'string', short: 'o' },
   suffix: { type: 'string' },
@@ -1240,6 +1314,8 @@ const CLI_OPTIONS = Object.freeze({
   quotes: { type: 'string', default: 'fullwidth' },
   whitespace: { type: 'string', default: 'blank' },
   backend: { type: 'string', default: 'auto' },
+  bom: { type: 'string', default: 'keep' },
+  'input-encoding': { type: 'string' },
   protect: { type: 'string' },
   'protect-name': { type: 'string', multiple: true, default: [] },
   'protect-file': { type: 'string' },
@@ -1261,6 +1337,7 @@ export function parseCliArgs(argv) {
     files: positionals,
     text: values.text ?? null,
     stdin: values.stdin,
+    stdout: values.stdout,
     inPlace: values['in-place'],
     output: values.output ?? null,
     suffix: values.suffix ?? null,
@@ -1285,6 +1362,9 @@ export function parseCliArgs(argv) {
     quotes: values.quotes,
     symbols: values.symbols,
     backend: values.backend,
+    bom: values.bom,
+    inputEncoding: values['input-encoding'] ?? null,
+    printScripts: values['print-scripts'],
     help: values.help,
     version: values.version,
   };
@@ -1298,6 +1378,7 @@ function validateOptions(opts) {
     '--quotes': ['fullwidth', 'curly', 'keep'],
     '--backend': ['auto', 'builtin', 'opencc'],
     '--whitespace': ['blank', 'full', 'off'],
+    '--bom': ['keep', 'strip', 'add'],
   };
   const keyOf = {
     '--format': opts.format,
@@ -1305,11 +1386,22 @@ function validateOptions(opts) {
     '--quotes': opts.quotes,
     '--backend': opts.backend,
     '--whitespace': opts.whitespace,
+    '--bom': opts.bom,
   };
   for (const [flag, list] of Object.entries(allowed)) {
     if (!list.includes(keyOf[flag])) {
       throw new Error(`${flag} 取值非法: ${keyOf[flag]}（可选 ${list.join('|')}）`, {
         cause: { flag, value: keyOf[flag] },
+      });
+    }
+  }
+  // 编码名提前校验：--text 输入不走解码，若等到文件阶段才报错会漏掉这条路径
+  if (opts.inputEncoding) {
+    try {
+      new TextDecoder(opts.inputEncoding);
+    } catch {
+      throw new Error(`--input-encoding 取值非法: ${opts.inputEncoding}（当前 Node 不支持该编码标签）`, {
+        cause: { flag: '--input-encoding', value: opts.inputEncoding },
       });
     }
   }
@@ -1337,6 +1429,10 @@ export async function main(argv = process.argv.slice(2)) {
     process.stdout.write(`normalize.mjs ${VERSION} (node ${process.versions.node})\n`);
     return 0;
   }
+  if (opts.printScripts) {
+    process.stdout.write(`${formatScriptTable()}\n`);
+    return 0;
+  }
   try {
     validateOptions(opts);
   } catch (err) {
@@ -1344,12 +1440,19 @@ export async function main(argv = process.argv.slice(2)) {
     return 2;
   }
 
-  /** @type {Array<{label:string, text:string, bom:boolean}>} */
+  /** @type {Array<{label:string, text:string, bom:boolean, encoding:string, confidence:string}>} */
   let items;
   if (opts.text !== null) {
-    items = [{ label: '<text>', text: opts.text, bom: false }];
+    items = [{ label: '<text>', text: opts.text, bom: false, encoding: 'utf-8', confidence: 'explicit' }];
   } else if (opts.stdin) {
-    items = [{ label: '<stdin>', text: readStdin(), bom: false }];
+    let s;
+    try {
+      s = readStdin(opts.inputEncoding);
+    } catch (err) {
+      process.stderr.write(`[error] ${err?.message ?? err}\n`);
+      return 2;
+    }
+    items = [{ label: '<stdin>', ...s, confidence: s.encodingConfidence }];
   } else if (opts.files.length) {
     items = [];
     for (const f of opts.files) {
@@ -1357,7 +1460,13 @@ export async function main(argv = process.argv.slice(2)) {
         process.stderr.write(`[error] 文件不存在: ${f}\n`);
         return 2;
       }
-      items.push({ label: f, ...(await readText(f)) });
+      try {
+        const r = await readText(f, opts.inputEncoding);
+        items.push({ label: f, ...r, confidence: r.encodingConfidence });
+      } catch (err) {
+        process.stderr.write(`[error] ${f}: ${err?.message ?? err}\n`);
+        return 2;
+      }
     }
   } else {
     process.stdout.write(HELP);
@@ -1366,6 +1475,10 @@ export async function main(argv = process.argv.slice(2)) {
 
   if (opts.files.length > 1 && !(opts.inPlace || opts.suffix || opts.check)) {
     process.stderr.write('[error] 多文件处理请显式指定 --in-place / --suffix / --check\n');
+    return 2;
+  }
+  if (opts.output && (opts.inPlace || opts.suffix)) {
+    process.stderr.write('[error] --output 不能与 --in-place / --suffix 同时使用\n');
     return 2;
   }
 
@@ -1381,19 +1494,44 @@ export async function main(argv = process.argv.slice(2)) {
     const { text: result, stats } = normalizeText(item.text, opts, convert);
     if (result !== item.text) changedAny = true;
 
+    const encInfo = { encoding: item.encoding, confidence: item.confidence };
     if (opts.report || opts.reportJson || opts.check) {
-      emitReport(item.label, stats, backend, opts.reportJson);
+      emitReport(item.label, stats, backend, opts.reportJson, encInfo);
+    }
+    if (
+      encInfo.confidence !== 'high' &&
+      encInfo.confidence !== 'explicit' &&
+      (opts.report || opts.check)
+    ) {
+      process.stderr.write(
+        `[warn] ${item.label}: 输入编码判定为 ${encInfo.encoding}（置信度 ${encInfo.confidence}），` +
+          `如结果乱码请用 --input-encoding 指定\n`,
+      );
     }
     if (opts.diff) emitDiff(item.label, item.text, result);
 
     if (opts.check) continue;
-    if (opts.inPlace || opts.suffix) {
-      const target = opts.inPlace ? item.label : withSuffix(item.label, opts.suffix);
-      await writeText(target, result, item.bom);
-      process.stderr.write(`[written] ${target}\n`);
+
+    const bom = resolveBom(opts.bom, item.bom);
+    let target = null;
+    if (opts.inPlace) {
+      target = item.label;
+      if (!MD_EXTS.includes(extname(target).toLowerCase())) {
+        process.stderr.write(
+          `[warn] ${target}: --in-place 保持原扩展名；如需 Markdown 请改用默认输出或 --suffix\n`,
+        );
+      }
+    } else if (opts.suffix) {
+      target = appendMarkdownExt(withSuffix(item.label, opts.suffix));
     } else if (opts.output) {
-      await writeText(opts.output, result, item.bom);
-      process.stderr.write(`[written] ${opts.output}\n`);
+      target = ensureMarkdownPath(opts.output);
+    } else if (isFile && !opts.stdout) {
+      target = defaultOutputPath(item.label);
+    }
+
+    if (target !== null) {
+      await writeText(target, result, bom);
+      process.stderr.write(`[written] ${target}\n`);
     } else {
       process.stdout.write(result);
     }

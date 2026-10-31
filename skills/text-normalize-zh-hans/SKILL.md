@@ -3,13 +3,14 @@ name: text-normalize-zh-hans
 repo: https://github.com/kamaslau/skills
 description: "中文文本字形级规范化：全角阿拉伯数字转半角、半角标点转全角、非简体中文字符转简体（日语/韩语/朝鲜语人名例外），严禁润色或改写语法。当用户提到「文字处理」「文本规范化」「排版清理」「繁转简」「全角半角」「标点全角化」「数字半角化」，或粘贴一段中英混排、繁简混排的文本要求处理时，应使用本技能。适用于 .txt/.md 等文件与对话中的文本片段。"
 allowed-tools: Bash, Read, Edit
-version: 2.2.0
+version: 2.3.0
 agent_created: true
 ---
 
 # 中文文本规范化（text-normalize-zh-hans）
 
 对中文文本执行**纯字形级**替换，由 `scripts/normalize.mjs`（Node.js ESM，零依赖）确定性完成。
+**输出恒为 UTF-8 编码的 Markdown 文件（`.md`）**，输入则允许 UTF-8 / UTF-16 / GB18030 / Big5 / EUC-KR / Shift_JIS。
 
 ## 四条红线（任何情况下不得违反）
 
@@ -60,11 +61,30 @@ node scripts/normalize.mjs <文件> --protect "鳩山由紀夫,盧武鉉" --in-p
 ### Step 3：执行转换
 
 ```bash
+node scripts/normalize.mjs <文件> --report                # 默认写出 <文件>.md（UTF-8）
 node scripts/normalize.mjs <文件> --in-place --report      # 覆盖原文件
-node scripts/normalize.mjs <文件> --suffix .norm --report  # 输出 <文件>.norm，保留原件
-node scripts/normalize.mjs --text "這是一段測試,數字１２３"   # 处理对话中的文本片段
+node scripts/normalize.mjs <文件> --suffix .norm --report  # 输出 <文件>.norm.md，保留原件
+node scripts/normalize.mjs --text "這是一段測試,數字１２３"   # 处理对话中的文本片段（输出到 stdout）
 node scripts/normalize.mjs a.md b.md --in-place            # 批量（必须显式指定写回方式）
 ```
+
+## 输入编码与输出约定
+
+**输入**：自动探测，顺序为 BOM → 严格 UTF-8 合法性 → UTF-16 空字节模式 → GB18030/Big5/EUC-KR/Shift_JIS 字频打分。非 UTF-8 输入会被解码后再转码为 UTF-8 输出。探测结果随 `--report` 打印；置信度非 high 时另打一行 `[warn]`，此时可用 `--input-encoding` 强制指定：
+
+```bash
+node scripts/normalize.mjs <文件> --input-encoding gb18030 --report
+```
+
+**输出**（三件事恒定）：
+
+| 项 | 规则 |
+| --- | --- |
+| 编码 | 一律 UTF-8。`--bom keep\|strip\|add`，默认 `keep`（沿用输入是否带 BOM） |
+| 扩展名 | 一律 `.md`。`-o` 会替换扩展名（`out.txt` → `out.md`）；`--suffix` 保留用户后缀再追加（`.norm` → `a.norm.md`） |
+| 结尾 | 保证以单个换行结尾，并沿用正文既有行尾风格（LF / CRLF 不被改写） |
+
+文件输入的默认输出路径：`a.txt` → `a.md`；`a.md` → `a.normalized.md`（避免覆盖同名源文件）。`--stdout` 可强制只打印不写文件。`--in-place` 是唯一可能保持非 `.md` 扩展名的模式，此时会打印 `[warn]` 提示。
 
 ### Step 4：复核（必做）
 
@@ -79,7 +99,9 @@ node scripts/normalize.mjs <文件> --check --diff
 | 参数 | 作用 |
 | --- | --- |
 | `--text` / `--stdin` / 文件路径 | 输入方式，三选一 |
-| `--in-place` / `--suffix` / `--output` | 写回方式；均不给则输出到 stdout |
+| `--in-place` / `--suffix` / `--output` / `--stdout` | 写回方式；均不给则写 `<文件>.md` |
+| `--input-encoding <编码>` | 强制输入编码，跳过自动探测 |
+| `--bom keep\|strip\|add` | UTF-8 BOM 策略，默认 `keep` |
 | `--check` | 只报告不改动，有改动时退出码 1 |
 | `--report` / `--report-json` / `--diff` | 统计与逐行差异（输出到 stderr） |
 | `--protect` / `--protect-name` / `--protect-file` | 追加保护名单（日韩人名） |
@@ -143,4 +165,6 @@ node scripts/selftest.mjs --only-opencc
 - 悬空标点只处理**全角**标点，英文的 `?!`、`...` 不受影响。
 - 全程按 UTF-16 码元索引处理；本工具关心的字符均在 BMP，行为与按码点处理一致。
 - `--text` 的取值若以 `-` 开头，必须写成 `--text=-甲`（`parseArgs` 的约束：`--text -甲` 会被判定为缺值）。
-- 完整映射表与判定细节见 `references/rules.md`。
+- `--stdin` 需要管道输入；用 `readSync` 循环读原始字节，因为 `readFileSync(0)` 在部分平台只返回首个分片，而 `process.stdin` 的异步迭代会先按 UTF-8 解码、破坏非 UTF-8 字节。
+- 编码探测对「GB18030 简体 vs Big5 繁体」靠高频字命中区分，短文本（几十字以内）或纯 ASCII 符号串可能判不准——用 `--input-encoding` 兜底。
+- 完整映射表与判定细节见 `references/rules.md`；**UTF-8 字节区间与语种判定的关系**见 `references/utf8-script-ranges.md`（也可用 `node scripts/normalize.mjs --print-scripts` 打印对照表）。
